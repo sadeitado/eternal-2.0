@@ -1,6 +1,7 @@
 --[[
-    Auto Farm Pro v3 - Anime Eternal
-    Correções: UI responsiva, debug visível, erros no console
+    Auto Farm Pro v6 - Anime Eternal
+    Ranks: E, D, C, B, A, S, SS, SSS
+    Mobs detectados por Nome + Rank
 --]]
 
 local Players = game:GetService("Players")
@@ -10,7 +11,24 @@ local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-print("[AutoFarm v3] Iniciando script...")
+print("[AutoFarm v6] Iniciando...")
+
+-- ============================
+-- RANKS CONHECIDOS (ordem crescente)
+-- ============================
+local RANK_ORDER = { ["E"]=1, ["D"]=2, ["C"]=3, ["B"]=4, ["A"]=5, ["S"]=6, ["SS"]=7, ["SSS"]=8 }
+
+-- Cores por rank
+local RANK_COLORS = {
+    E   = Color3.fromRGB(180, 180, 180),
+    D   = Color3.fromRGB(120, 220, 120),
+    C   = Color3.fromRGB(100, 170, 255),
+    B   = Color3.fromRGB(180, 110, 255),
+    A   = Color3.fromRGB(255, 210, 60),
+    S   = Color3.fromRGB(255, 120, 50),
+    SS  = Color3.fromRGB(255, 50, 150),
+    SSS = Color3.fromRGB(255, 0, 0),
+}
 
 -- ============================
 -- CONFIG
@@ -25,11 +43,85 @@ local Config = {
 local State = {
     LastAttack = 0,
     MobCache = {},
+    MobList = {},
     AutoFarmThread = nil,
 }
 
 -- ============================
--- FUNÇÕES
+-- EXTRAIR RANK DO MOB
+-- ============================
+-- Procura o rank em vários lugares possíveis
+local function extractRank(mob)
+    -- 1) Atributos do mob (mais moderno)
+    for _, attr in ipairs(mob:GetAttributes()) do
+        local val = mob:GetAttribute(attr)
+        if type(val) == "string" and RANK_ORDER[val:upper()] then
+            return val:upper()
+        end
+        if attr:lower():find("rank") or attr:lower():find("tier") then
+            if type(val) == "string" then return val:upper() end
+        end
+    end
+    -- 2) Filhos tipo StringValue com nome "Rank" ou "Tier"
+    for _, child in ipairs(mob:GetChildren()) do
+        local cn = child.Name:lower()
+        if (cn:find("rank") or cn:find("tier")) and child:IsA("StringValue") then
+            local v = child.Value:upper()
+            if RANK_ORDER[v] then return v end
+        end
+    end
+    -- 3) Qualquer StringValue cujo valor seja um rank
+    for _, child in ipairs(mob:GetChildren()) do
+        if child:IsA("StringValue") then
+            local v = child.Value:upper()
+            if RANK_ORDER[v] then return v end
+        end
+    end
+    -- 4) Pelo nome do Model (ex: "Bandit (S)", "Bandit_S", "Bandit S")
+    local fromName = mob.Name:match("%(([EDCBAS]+)%)")
+        or mob.Name:match("[%s_%-]([EDCBAS]+)$")
+        or mob.Name:match("([EDCBAS]+)[%s_%-]")
+    if fromName then
+        local up = fromName:upper()
+        if RANK_ORDER[up] then return up end
+    end
+    -- 5) DisplayName do Humanoid
+    local hum = mob:FindFirstChildOfClass("Humanoid")
+    if hum and hum.DisplayName then
+        local m = hum.DisplayName:match("%(([EDCBAS]+)%)") or hum.DisplayName:match("[%s_%-]([EDCBAS]+)$")
+        if m and RANK_ORDER[m:upper()] then return m:upper() end
+    end
+    return "?"
+end
+
+-- ============================
+-- EXTRAIR NOME DO MOB
+-- ============================
+local function extractName(mob)
+    -- 1) Humanoid.DisplayName (costuma ser o nome legível no Eternal)
+    local hum = mob:FindFirstChildOfClass("Humanoid")
+    if hum and hum.DisplayName and hum.DisplayName ~= "" then
+        -- Remove o rank do display name se estiver junto
+        local clean = hum.DisplayName:gsub("%s*%([EDCBAS]+%)", ""):gsub("[%s_%-][EDCBAS]+$", ""):gsub("^[EDCBAS]+[%s_%-]", "")
+        clean = clean:gsub("^%s+", ""):gsub("%s+$", "")
+        if #clean > 0 then return clean end
+    end
+    -- 2) StringValue chamada "Name" ou "MobName"
+    for _, child in ipairs(mob:GetChildren()) do
+        if child:IsA("StringValue") then
+            local cn = child.Name:lower()
+            if (cn == "name" or cn == "mobname" or cn:find("displayname")) and child.Value ~= "" then
+                return child.Value
+            end
+        end
+    end
+    -- 3) Nome do Model, limpando sufixos
+    local n = mob.Name:gsub("%s*%(%d+%)$", ""):gsub("%s*%([EDCBAS]+%)$", ""):gsub("[%s_%-][EDCBAS]+$", "")
+    return n
+end
+
+-- ============================
+-- DETECÇÃO
 -- ============================
 local function isAliveMob(instance)
     if not instance or not instance.Parent then return false end
@@ -41,39 +133,49 @@ local function isAliveMob(instance)
     return true, humanoid
 end
 
-local function getMobName(mob)
-    return (mob.Name:gsub("%s*%(%d+%)$", ""))
-end
-
 local function scanMobs()
-    print("[AutoFarm] Escaneando workspace...")
+    print("[AutoFarm] Escaneando...")
     local t0 = tick()
     local mobTypes = {}
     local totalFound = 0
     local count = 0
     for _, d in ipairs(Workspace:GetDescendants()) do
         count = count + 1
-        -- Yield a cada 500 objetos para não travar a UI
-        if count % 500 == 0 then
-            task.wait()
-        end
+        if count % 500 == 0 then task.wait() end
         if isAliveMob(d) then
             totalFound = totalFound + 1
-            local n = getMobName(d)
-            if not mobTypes[n] then mobTypes[n] = { name = n, count = 0, examples = {} } end
-            mobTypes[n].count = mobTypes[n].count + 1
-            table.insert(mobTypes[n].examples, d)
+            local name = extractName(d)
+            local rank = extractRank(d)
+            local key = name .. " [" .. rank .. "]"
+            if not mobTypes[key] then
+                mobTypes[key] = { name = name, rank = rank, key = key, count = 0, examples = {} }
+            end
+            mobTypes[key].count = mobTypes[key].count + 1
+            table.insert(mobTypes[key].examples, d)
         end
     end
     local list = {}
     for _, data in pairs(mobTypes) do table.insert(list, data) end
-    table.sort(list, function(a,b) return a.count > b.count end)
+    -- Ordena por rank crescente, depois por nome
+    table.sort(list, function(a,b)
+        local ra = RANK_ORDER[a.rank] or 99
+        local rb = RANK_ORDER[b.rank] or 99
+        if ra ~= rb then return ra < rb end
+        return a.name < b.name
+    end)
     State.MobCache = mobTypes
+    State.MobList = list
     local elapsed = math.floor((tick() - t0) * 100) / 100
-    print("[AutoFarm] Scan OK: " .. totalFound .. " mobs, " .. #list .. " tipos, " .. elapsed .. "s")
+    print("[AutoFarm] Scan OK: " .. totalFound .. " mobs, " .. #list .. " tipos únicos (" .. elapsed .. "s)")
+    for _, d in ipairs(list) do
+        print("  - [" .. d.rank .. "] " .. d.name .. " (" .. d.count .. "x)")
+    end
     return list, totalFound
 end
 
+-- ============================
+-- ATAQUE
+-- ============================
 local function attackMob(mob, humanoid)
     if not mob or not mob.PrimaryPart or not humanoid then return end
     if humanoid.Health <= 0 then return end
@@ -90,10 +192,10 @@ local function attackMob(mob, humanoid)
 end
 
 -- ============================
--- AUTO FARM LOOP (com yield)
+-- AUTO FARM LOOP
 -- ============================
 local function autoFarmLoop()
-    print("[AutoFarm] Loop iniciado para: " .. tostring(Config.SelectedMob))
+    print("[AutoFarm] Loop iniciado: " .. tostring(Config.SelectedMob))
     while Config.AutoFarm do
         local char = LocalPlayer.Character
         if not char or not char:FindFirstChild("HumanoidRootPart") then
@@ -101,9 +203,7 @@ local function autoFarmLoop()
         end
         local myRoot = char.HumanoidRootPart
         local mobData = State.MobCache[Config.SelectedMob]
-        if not mobData then
-            task.wait(0.5) continue
-        end
+        if not mobData then task.wait(0.5) continue end
 
         local closestMob, closestDist, closestHumanoid = nil, math.huge, nil
         for _, mob in ipairs(mobData.examples) do
@@ -116,7 +216,6 @@ local function autoFarmLoop()
                 end
             end
         end
-
         if closestMob then
             local mobPos = closestMob.PrimaryPart.Position
             local dir = (myRoot.Position - mobPos).Unit
@@ -139,7 +238,7 @@ screenGui.ResetOnSpawn = false
 screenGui.Parent = PlayerGui
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 500, 0, 500)
+mainFrame.Size = UDim2.new(0, 540, 0, 600)
 mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
 mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
 mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
@@ -160,10 +259,10 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -70, 1, 0)
 title.Position = UDim2.new(0, 15, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "⚔️ AUTO FARM PRO v3"
+title.Text = "⚔️ AUTO FARM PRO v6 - Anime Eternal"
 title.TextColor3 = Color3.fromRGB(255,255,255)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 16
+title.TextSize = 15
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = topBar
 
@@ -236,13 +335,9 @@ local function makeButton(text, callback)
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
     btn.MouseButton1Click:Connect(function()
         print("[AutoFarm] Clicou: " .. text)
-        -- task.spawn para não travar a UI
         task.spawn(function()
             local ok, err = pcall(callback)
-            if not ok then
-                warn("[AutoFarm] ERRO no botão '" .. text .. "': " .. tostring(err))
-                setStatus("ERRO! Veja o console (F9)")
-            end
+            if not ok then warn("[AutoFarm] ERRO: " .. tostring(err)) setStatus("ERRO! Veja F9") end
         end)
     end)
     return btn
@@ -265,55 +360,102 @@ local function makeToggle(text, initial, callback)
         state = not state
         btn.BackgroundColor3 = state and Color3.fromRGB(0, 150, 80) or Color3.fromRGB(45, 45, 55)
         btn.Text = (state and "✔  " or "✘  ") .. text
-        print("[AutoFarm] Toggle '" .. text .. "' = " .. tostring(state))
+        print("[AutoFarm] Toggle: " .. text .. " = " .. tostring(state))
         task.spawn(function()
             local ok, err = pcall(callback, state)
-            if not ok then
-                warn("[AutoFarm] ERRO no toggle '" .. text .. "': " .. tostring(err))
-            end
+            if not ok then warn("[AutoFarm] ERRO: " .. tostring(err)) end
         end)
     end)
     return btn
 end
 
 -- ============================
--- BOTÕES
+-- UI DO AUTO FARM
 -- ============================
 makeSection("AUTO FARM")
 
-makeButton("🔍 Escanear Mobs (imprime no F9)", function()
+makeButton("🔍 Escanear Mobs (Nome + Rank)", function()
     setStatus("Escaneando...")
     local list, total = scanMobs()
-    if total == 0 then
-        setStatus("Nenhum mob encontrado")
-        return
-    end
-    local names = {}
-    for _, d in ipairs(list) do table.insert(names, d.name) end
-    Config.SelectedMob = names[1]
-    setStatus("1º mob: " .. names[1] .. " | Total: " .. total)
+    if total == 0 then setStatus("Nenhum mob encontrado") return end
+    setStatus("Total: " .. total .. " mobs | " .. #list .. " tipos")
+    populateDropdown()
 end)
 
-makeButton("🎯 Trocar Mob Alvo", function()
-    if not Config.SelectedMob then
-        setStatus("Escaneie primeiro")
+-- Container do dropdown
+local dropdownContainer = Instance.new("Frame")
+dropdownContainer.Size = UDim2.new(1, 0, 0, 0)
+dropdownContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+dropdownContainer.BorderSizePixel = 0
+dropdownContainer.AutomaticSize = Enum.AutomaticSize.Y
+dropdownContainer.Parent = content
+Instance.new("UICorner", dropdownContainer).CornerRadius = UDim.new(0, 8)
+
+local dropdownLabel = Instance.new("TextLabel")
+dropdownLabel.Size = UDim2.new(1, -16, 0, 24)
+dropdownLabel.Position = UDim2.new(0, 8, 0, 4)
+dropdownLabel.BackgroundTransparency = 1
+dropdownLabel.Text = "🎯 Escolha o mob:"
+dropdownLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+dropdownLabel.Font = Enum.Font.GothamSemibold
+dropdownLabel.TextSize = 12
+dropdownLabel.TextXAlignment = Enum.TextXAlignment.Left
+dropdownLabel.Parent = dropdownContainer
+
+local dropdownLayout = Instance.new("UIListLayout", dropdownContainer)
+dropdownLayout.Padding = UDim.new(0, 2)
+dropdownLayout.SortOrder = Enum.SortOrder.LayoutOrder
+dropdownLayout.Parent = dropdownContainer
+
+function populateDropdown()
+    for _, child in ipairs(dropdownContainer:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    if #State.MobList == 0 then
+        local empty = Instance.new("TextButton")
+        empty.Size = UDim2.new(1, -16, 0, 28)
+        empty.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+        empty.Text = "  (sem mobs — clique em Escanear)"
+        empty.TextColor3 = Color3.fromRGB(140, 140, 150)
+        empty.Font = Enum.Font.Gotham
+        empty.TextSize = 12
+        empty.BorderSizePixel = 0
+        empty.TextXAlignment = Enum.TextXAlignment.Left
+        empty.Parent = dropdownContainer
+        Instance.new("UICorner", empty).CornerRadius = UDim.new(0, 6)
         return
     end
-    local names = {}
-    for n, _ in pairs(State.MobCache) do table.insert(names, n) end
-    table.sort(names)
-    local idx = 1
-    for i, n in ipairs(names) do
-        if n == Config.SelectedMob then idx = i % #names + 1 break end
+
+    for _, data in ipairs(State.MobList) do
+        local mobBtn = Instance.new("TextButton")
+        mobBtn.Size = UDim2.new(1, -16, 0, 30)
+        mobBtn.BackgroundColor3 = (Config.SelectedMob == data.key)
+            and Color3.fromRGB(0, 120, 200)
+            or Color3.fromRGB(45, 45, 55)
+        mobBtn.Text = "  [" .. data.rank .. "]  " .. data.name .. "   (" .. data.count .. "x)"
+        mobBtn.TextColor3 = RANK_COLORS[data.rank] or Color3.fromRGB(240, 240, 240)
+        mobBtn.Font = Enum.Font.GothamSemibold
+        mobBtn.TextSize = 13
+        mobBtn.BorderSizePixel = 0
+        mobBtn.AutoButtonColor = false
+        mobBtn.TextXAlignment = Enum.TextXAlignment.Left
+        mobBtn.Parent = dropdownContainer
+        Instance.new("UICorner", mobBtn).CornerRadius = UDim.new(0, 6)
+
+        mobBtn.MouseButton1Click:Connect(function()
+            Config.SelectedMob = data.key
+            print("[AutoFarm] Alvo escolhido: " .. data.key)
+            setStatus("Alvo: [" .. data.rank .. "] " .. data.name)
+            populateDropdown()
+        end)
     end
-    Config.SelectedMob = names[idx]
-    setStatus("Alvo: " .. Config.SelectedMob .. " (" .. State.MobCache[Config.SelectedMob].count .. "x)")
-end)
+end
+
+populateDropdown()
 
 makeToggle("⚔️ Ativar Auto Farm", false, function(state)
     if state and not Config.SelectedMob then
-        setStatus("Escaneie mobs primeiro!")
-        -- Desmarca o toggle
+        setStatus("Escolha um mob primeiro")
         return
     end
     Config.AutoFarm = state
@@ -327,9 +469,44 @@ makeToggle("⚔️ Ativar Auto Farm", false, function(state)
     end
 end)
 
+-- ============================
+-- DEBUG
+-- ============================
 makeSection("DEBUG")
 
-makeButton("📋 Listar Prompts no Console", function()
+makeButton("🔬 Inspecionar 1º Mob (F9)", function()
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if isAliveMob(d) then
+            print("========== INSPEÇÃO DE MOB ==========")
+            print("Model.Name = " .. d.Name)
+            print("Atributos:")
+            for _, attr in ipairs(d:GetAttributes()) do
+                print("  " .. attr .. " = " .. tostring(d:GetAttribute(attr)))
+            end
+            print("Filhos:")
+            for _, c in ipairs(d:GetChildren()) do
+                local val = ""
+                if c:IsA("StringValue") then val = " = \"" .. c.Value .. "\""
+                elseif c:IsA("NumberValue") or c:IsA("IntValue") then val = " = " .. c.Value
+                elseif c:IsA("BoolValue") then val = " = " .. tostring(c.Value)
+                end
+                print("  [" .. c.ClassName .. "] " .. c.Name .. val)
+            end
+            local hum = d:FindFirstChildOfClass("Humanoid")
+            if hum then
+                print("Humanoid:")
+                print("  DisplayName = " .. hum.DisplayName)
+                print("  Health = " .. hum.Health .. "/" .. hum.MaxHealth)
+            end
+            print("=====================================")
+            setStatus("Inspeção no F9")
+            return
+        end
+    end
+    setStatus("Nenhum mob")
+end)
+
+makeButton("📋 Listar Prompts (F9)", function()
     local n = 0
     for _, obj in ipairs(Workspace:GetDescendants()) do
         if obj:IsA("ProximityPrompt") then
@@ -337,32 +514,7 @@ makeButton("📋 Listar Prompts no Console", function()
             print("[Prompt] " .. (obj.Parent and obj.Parent.Name or "?") .. " | Action: " .. obj.ActionText)
         end
     end
-    setStatus("Prompts: " .. n .. " (veja F9)")
-end)
-
-makeButton("📋 Listar ClickDetectors no Console", function()
-    local n = 0
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("ClickDetector") then
-            n = n + 1
-            print("[ClickDetector] " .. (obj.Parent and obj.Parent.Name or "?"))
-        end
-    end
-    setStatus("ClickDetectors: " .. n .. " (veja F9)")
-end)
-
-makeButton("📋 Listar Pastas Dungeon no Console", function()
-    local n = 0
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model") or obj:IsA("Folder") then
-            local nm = obj.Name:lower()
-            if nm:find("dungeon") or nm:find("raid") or nm:find("maze") or nm:find("lobby") then
-                n = n + 1
-                print("[Obj] " .. obj:GetFullName())
-            end
-        end
-    end
-    setStatus("Objetos dungeon: " .. n .. " (veja F9)")
+    setStatus("Prompts: " .. n)
 end)
 
 makeButton("🛑 Parar Tudo", function()
@@ -371,14 +523,10 @@ makeButton("🛑 Parar Tudo", function()
     setStatus("Tudo parado")
 end)
 
--- ============================
--- FECHAR
--- ============================
 closeBtn.MouseButton1Click:Connect(function()
     Config.AutoFarm = false
     screenGui:Destroy()
-    print("[AutoFarm] Script encerrado")
 end)
 
-print("[AutoFarm v3] UI criada com sucesso!")
-setStatus("Pronto! Abra F9 e clique em Escanear Mobs")
+print("[AutoFarm v6] Pronto!")
+setStatus("Clique em '🔍 Escanear Mobs'")
