@@ -1,43 +1,34 @@
 --[[
-    Auto Farm Pro v7 - Anime Eternal
-    Fix: bug da UI seguindo o cursor
-    Melhorias: inspeção visível na UI, toggle de parar corrigido
+    Auto Farm Pro v9 - Anime Eternal
+    Fix: teleporte apenas 1x por mob, só troca após matar
+    - Verifica se HP está caindo
+    - Timeout se não conseguir matar
 --]]
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local VirtualUser = game:GetService("VirtualUser")
-local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-print("[AutoFarm v7] Iniciando...")
+print("[AutoFarm v9] Iniciando...")
 
--- ============================
--- RANKS
--- ============================
 local RANK_ORDER = { ["E"]=1, ["D"]=2, ["C"]=3, ["B"]=4, ["A"]=5, ["S"]=6, ["SS"]=7, ["SSS"]=8 }
-
 local RANK_COLORS = {
-    E   = Color3.fromRGB(180, 180, 180),
-    D   = Color3.fromRGB(120, 220, 120),
-    C   = Color3.fromRGB(100, 170, 255),
-    B   = Color3.fromRGB(180, 110, 255),
-    A   = Color3.fromRGB(255, 210, 60),
-    S   = Color3.fromRGB(255, 120, 50),
-    SS  = Color3.fromRGB(255, 50, 150),
-    SSS = Color3.fromRGB(255, 0, 0),
+    E=Color3.fromRGB(180,180,180), D=Color3.fromRGB(120,220,120),
+    C=Color3.fromRGB(100,170,255), B=Color3.fromRGB(180,110,255),
+    A=Color3.fromRGB(255,210,60), S=Color3.fromRGB(255,120,50),
+    SS=Color3.fromRGB(255,50,150), SSS=Color3.fromRGB(255,0,0),
 }
 
--- ============================
--- CONFIG
--- ============================
 local Config = {
     AutoFarm = false,
     SelectedMob = nil,
     TeleportDistance = 5,
     AttackCooldown = 0.2,
+    KillTimeout = 10,       -- segundos tentando matar o mesmo mob
+    HpCheckInterval = 1.5,  -- verifica HP a cada X segundos
 }
 
 local State = {
@@ -45,11 +36,27 @@ local State = {
     MobCache = {},
     MobList = {},
     AutoFarmThread = nil,
+    CurrentTarget = nil,
+    TargetStartTime = 0,
+    TargetStartHp = 0,
+    LastHpCheck = 0,
+    TargetTeleported = false,  -- ← marca se já teleportou pro alvo atual
+    LastTargetHp = 0,          -- ← último HP conhecido, pra saber se está caindo
 }
 
 -- ============================
--- EXTRAÇÃO
+-- UTILS
 -- ============================
+local function looksLikeId(s)
+    if #s < 20 then return false end
+    local numeric = 0
+    for i = 1, #s do
+        local c = s:sub(i,i)
+        if c:match("%d") or c == "-" then numeric = numeric + 1 end
+    end
+    return (numeric / #s) > 0.4
+end
+
 local function extractRank(mob)
     for _, attr in ipairs(mob:GetAttributes()) do
         local val = mob:GetAttribute(attr)
@@ -72,10 +79,7 @@ local function extractRank(mob)
         end
     end
     local fromName = mob.Name:match("%(([EDCBAS]+)%)") or mob.Name:match("[%s_%-]([EDCBAS]+)$")
-    if fromName then
-        local up = fromName:upper()
-        if RANK_ORDER[up] then return up end
-    end
+    if fromName and RANK_ORDER[fromName:upper()] then return fromName:upper() end
     local hum = mob:FindFirstChildOfClass("Humanoid")
     if hum and hum.DisplayName then
         local m = hum.DisplayName:match("%(([EDCBAS]+)%)") or hum.DisplayName:match("[%s_%-]([EDCBAS]+)$")
@@ -86,26 +90,29 @@ end
 
 local function extractName(mob)
     local hum = mob:FindFirstChildOfClass("Humanoid")
-    if hum and hum.DisplayName and hum.DisplayName ~= "" then
-        local clean = hum.DisplayName:gsub("%s*%([EDCBAS]+%)", ""):gsub("[%s_%-][EDCBAS]+$", ""):gsub("^[EDCBAS]+[%s_%-]", "")
+    if hum and hum.DisplayName and hum.DisplayName ~= "" and not looksLikeId(hum.DisplayName) then
+        local clean = hum.DisplayName:gsub("%s*%([EDCBAS]+%)", ""):gsub("[%s_%-][EDCBAS]+$", "")
         clean = clean:gsub("^%s+", ""):gsub("%s+$", "")
         if #clean > 0 then return clean end
     end
     for _, child in ipairs(mob:GetChildren()) do
-        if child:IsA("StringValue") then
+        if child:IsA("StringValue") and not looksLikeId(child.Value) then
             local cn = child.Name:lower()
-            if (cn == "name" or cn == "mobname" or cn:find("displayname")) and child.Value ~= "" then
+            if cn == "name" or cn == "mobname" or cn:find("displayname") then
                 return child.Value
             end
         end
     end
+    for _, child in ipairs(mob:GetChildren()) do
+        if child:IsA("StringValue") and not looksLikeId(child.Value) and #child.Value < 40 and #child.Value > 2 then
+            return child.Value
+        end
+    end
     local n = mob.Name:gsub("%s*%(%d+%)$", ""):gsub("%s*%([EDCBAS]+%)$", ""):gsub("[%s_%-][EDCBAS]+$", "")
+    if looksLikeId(n) then return "Mob-" .. n:sub(1, 6) end
     return n
 end
 
--- ============================
--- DETECÇÃO
--- ============================
 local function isAliveMob(instance)
     if not instance or not instance.Parent then return false end
     if not instance:IsA("Model") then return false end
@@ -117,7 +124,6 @@ local function isAliveMob(instance)
 end
 
 local function scanMobs()
-    print("[AutoFarm] Escaneando...")
     local t0 = tick()
     local mobTypes = {}
     local totalFound = 0
@@ -147,8 +153,7 @@ local function scanMobs()
     end)
     State.MobCache = mobTypes
     State.MobList = list
-    local elapsed = math.floor((tick() - t0) * 100) / 100
-    print("[AutoFarm] Scan OK: " .. totalFound .. " mobs, " .. #list .. " tipos (" .. elapsed .. "s)")
+    print("[AutoFarm] Scan: " .. totalFound .. " mobs, " .. #list .. " tipos (" .. math.floor((tick()-t0)*100)/100 .. "s)")
     for _, d in ipairs(list) do
         print("  - [" .. d.rank .. "] " .. d.name .. " (" .. d.count .. "x)")
     end
@@ -174,7 +179,7 @@ local function attackMob(mob, humanoid)
 end
 
 -- ============================
--- AUTO FARM LOOP
+-- AUTO FARM LOOP (v9 - trava real de alvo)
 -- ============================
 local function autoFarmLoop()
     print("[AutoFarm] Loop iniciado: " .. tostring(Config.SelectedMob))
@@ -187,27 +192,102 @@ local function autoFarmLoop()
         local mobData = State.MobCache[Config.SelectedMob]
         if not mobData then task.wait(0.5) continue end
 
-        local closestMob, closestDist, closestHumanoid = nil, math.huge, nil
-        for _, mob in ipairs(mobData.examples) do
-            if mob.Parent and isAliveMob(mob) and mob.PrimaryPart then
-                local dist = (myRoot.Position - mob.PrimaryPart.Position).Magnitude
-                if dist < closestDist then
-                    closestDist = dist
-                    closestMob = mob
-                    closestHumanoid = mob:FindFirstChildOfClass("Humanoid")
+        -- ============================================
+        -- VERIFICAR SE O ALVO ATUAL AINDA É VÁLIDO
+        -- ============================================
+        local target = State.CurrentTarget
+        local needNewTarget = false
+
+        if not target then
+            needNewTarget = true
+        elseif not target.Parent then
+            print("[AutoFarm] Alvo desapareceu")
+            needNewTarget = true
+        else
+            local h = target:FindFirstChildOfClass("Humanoid")
+            if not h then
+                print("[AutoFarm] Alvo sem Humanoid")
+                needNewTarget = true
+            elseif h.Health <= 0 then
+                print("[AutoFarm] Alvo MORTO! HP = " .. h.Health)
+                needNewTarget = true
+            else
+                -- Verifica se HP está caindo (a cada X segundos)
+                local now = tick()
+                if now - State.LastHpCheck >= Config.HpCheckInterval then
+                    State.LastHpCheck = now
+                    if h.Health >= State.LastTargetHp and State.LastTargetHp > 0 then
+                        -- HP não caiu desde a última verificação
+                        print("[AutoFarm] HP não está caindo (" .. h.Health .. " = " .. State.LastTargetHp .. "). Skipping...")
+                        needNewTarget = true
+                    end
+                    State.LastTargetHp = h.Health
+                end
+
+                -- Timeout total
+                if now - State.TargetStartTime > Config.KillTimeout then
+                    print("[AutoFarm] Timeout de " .. Config.KillTimeout .. "s. Skipping...")
+                    needNewTarget = true
                 end
             end
         end
-        if closestMob then
-            local mobPos = closestMob.PrimaryPart.Position
-            local dir = (myRoot.Position - mobPos).Unit
-            local targetPos = mobPos + dir * Config.TeleportDistance
-            targetPos = Vector3.new(targetPos.X, mobPos.Y + 3, targetPos.Z)
-            myRoot.CFrame = CFrame.new(targetPos)
-            attackMob(closestMob, closestHumanoid)
+
+        -- ============================================
+        -- ESCOLHER NOVO ALVO (se necessário)
+        -- ============================================
+        if needNewTarget then
+            State.CurrentTarget = nil
+            State.TargetTeleported = false
+            local closestMob, closestDist = nil, math.huge
+            for _, mob in ipairs(mobData.examples) do
+                if mob.Parent and isAliveMob(mob) and mob.PrimaryPart then
+                    local dist = (myRoot.Position - mob.PrimaryPart.Position).Magnitude
+                    if dist < closestDist then
+                        closestDist = dist
+                        closestMob = mob
+                    end
+                end
+            end
+            if closestMob then
+                State.CurrentTarget = closestMob
+                State.TargetStartTime = tick()
+                State.LastHpCheck = tick()
+                State.LastTargetHp = 0
+                target = closestMob
+                local h = closestMob:FindFirstChildOfClass("Humanoid")
+                print("[AutoFarm] NOVO alvo (HP=" .. (h and h.Health or "?") .. ")")
+            else
+                task.wait(0.5)
+                continue
+            end
         end
+
+        -- ============================================
+        -- TELEPORTE: só 1x por alvo, ou se o mob se moveu muito
+        -- ============================================
+        if target and target.Parent and target.PrimaryPart then
+            local mobPos = target.PrimaryPart.Position
+            local distToMob = (myRoot.Position - mobPos).Magnitude
+
+            -- Teleporta SE:
+            --   - ainda não teleportou pra esse alvo, OU
+            --   - o mob se afastou muito (> 15 studs)
+            if not State.TargetTeleported or distToMob > 15 then
+                local dir = (myRoot.Position - mobPos).Unit
+                local targetPos = mobPos + dir * Config.TeleportDistance
+                targetPos = Vector3.new(targetPos.X, mobPos.Y + 3, targetPos.Z)
+                myRoot.CFrame = CFrame.new(targetPos)
+                State.TargetTeleported = true
+            end
+
+            -- Ataca continuamente
+            attackMob(target, target:FindFirstChildOfClass("Humanoid"))
+        end
+
         task.wait(0.1)
     end
+    State.CurrentTarget = nil
+    State.TargetTeleported = false
     print("[AutoFarm] Loop encerrado")
 end
 
@@ -217,27 +297,25 @@ end
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "AutoFarmPro"
 screenGui.ResetOnSpawn = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = PlayerGui
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 560, 0, 620)
+mainFrame.Size = UDim2.new(0, 560, 0, 640)
 mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
 mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
 mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
 mainFrame.BorderSizePixel = 0
-mainFrame.Active = false      -- ⚠️ IMPORTANTE: Active = false no frame principal
-mainFrame.Draggable = false   -- ⚠️ E Draggable = false
+mainFrame.Active = false
+mainFrame.Draggable = false
 mainFrame.Parent = screenGui
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
 
--- ⚠️ BARRA DE TÍTULO arrastável (só ela pode mover a janela)
 local topBar = Instance.new("Frame")
 topBar.Size = UDim2.new(1, 0, 0, 45)
 topBar.BackgroundColor3 = Color3.fromRGB(40, 90, 180)
 topBar.BorderSizePixel = 0
-topBar.Active = true           -- ⚠️ TopBar é Active
-topBar.Draggable = true        -- ⚠️ E Draggable
+topBar.Active = true
+topBar.Draggable = true
 topBar.Parent = mainFrame
 Instance.new("UICorner", topBar).CornerRadius = UDim.new(0, 12)
 
@@ -245,7 +323,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -70, 1, 0)
 title.Position = UDim2.new(0, 15, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "⚔️ AUTO FARM PRO v7 - Anime Eternal"
+title.Text = "⚔️ AUTO FARM PRO v9"
 title.TextColor3 = Color3.fromRGB(255,255,255)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 15
@@ -361,7 +439,7 @@ end
 -- ============================
 makeSection("AUTO FARM")
 
-makeButton("🔍 Escanear Mobs (Nome + Rank)", function()
+makeButton("🔍 Escanear Mobs", function()
     setStatus("Escaneando...")
     local list, total = scanMobs()
     if total == 0 then setStatus("Nenhum mob encontrado") return end
@@ -369,7 +447,6 @@ makeButton("🔍 Escanear Mobs (Nome + Rank)", function()
     populateDropdown()
 end)
 
--- Dropdown
 local dropdownContainer = Instance.new("Frame")
 dropdownContainer.Size = UDim2.new(1, 0, 0, 0)
 dropdownContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
@@ -399,13 +476,11 @@ function populateDropdown()
         if child:IsA("TextButton") then child:Destroy() end
     end
     if #State.MobList == 0 then return end
-
     for _, data in ipairs(State.MobList) do
         local mobBtn = Instance.new("TextButton")
         mobBtn.Size = UDim2.new(1, -16, 0, 30)
         mobBtn.BackgroundColor3 = (Config.SelectedMob == data.key)
-            and Color3.fromRGB(0, 120, 200)
-            or Color3.fromRGB(45, 45, 55)
+            and Color3.fromRGB(0, 120, 200) or Color3.fromRGB(45, 45, 55)
         mobBtn.Text = "  [" .. data.rank .. "]  " .. data.name .. "   (" .. data.count .. "x)"
         mobBtn.TextColor3 = RANK_COLORS[data.rank] or Color3.fromRGB(240, 240, 240)
         mobBtn.Font = Enum.Font.GothamSemibold
@@ -415,9 +490,10 @@ function populateDropdown()
         mobBtn.TextXAlignment = Enum.TextXAlignment.Left
         mobBtn.Parent = dropdownContainer
         Instance.new("UICorner", mobBtn).CornerRadius = UDim.new(0, 6)
-
         mobBtn.MouseButton1Click:Connect(function()
             Config.SelectedMob = data.key
+            State.CurrentTarget = nil
+            State.TargetTeleported = false
             print("[AutoFarm] Alvo: " .. data.key)
             setStatus("Alvo: [" .. data.rank .. "] " .. data.name)
             populateDropdown()
@@ -428,9 +504,14 @@ end
 local autoFarmToggle = makeToggle("⚔️ Ativar Auto Farm", false, function(state)
     if state and not Config.SelectedMob then
         setStatus("Escolha um mob primeiro")
+        autoFarmToggle.setState(false)
+        autoFarmToggle.button.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+        autoFarmToggle.button.Text = "✘  ⚔️ Ativar Auto Farm"
         return
     end
     Config.AutoFarm = state
+    State.CurrentTarget = nil
+    State.TargetTeleported = false
     if state then
         setStatus("Farm ativo: " .. Config.SelectedMob)
         if not State.AutoFarmThread then
@@ -441,12 +522,8 @@ local autoFarmToggle = makeToggle("⚔️ Ativar Auto Farm", false, function(sta
     end
 end)
 
--- ============================
--- INSPEÇÃO NA UI
--- ============================
 makeSection("INSPEÇÃO")
 
--- Painel de inspeção (texto que aparece dentro do jogo)
 local inspectBox = Instance.new("TextLabel")
 inspectBox.Size = UDim2.new(1, 0, 0, 0)
 inspectBox.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
@@ -461,23 +538,28 @@ inspectBox.TextWrapped = true
 inspectBox.AutomaticSize = Enum.AutomaticSize.Y
 inspectBox.Parent = content
 Instance.new("UICorner", inspectBox).CornerRadius = UDim.new(0, 8)
-Instance.new("UIPadding", inspectBox).PaddingTop = UDim.new(0, 8)
+local inspectPad = Instance.new("UIPadding", inspectBox)
+inspectPad.PaddingTop = UDim.new(0, 8)
+inspectPad.PaddingLeft = UDim.new(0, 8)
+inspectPad.PaddingRight = UDim.new(0, 8)
+inspectPad.PaddingBottom = UDim.new(0, 8)
 
 local function inspectFirstMob()
     for _, d in ipairs(Workspace:GetDescendants()) do
         if isAliveMob(d) then
             local lines = {}
+            table.insert(lines, "== ESTRUTURA ==")
             table.insert(lines, "Model.Name: " .. d.Name)
-            table.insert(lines, "ClassName: " .. d.ClassName)
+            table.insert(lines, "")
             table.insert(lines, "--- Atributos ---")
             local attrs = d:GetAttributes()
-            if #attrs == 0 then
-                table.insert(lines, "(nenhum)")
+            if #attrs == 0 then table.insert(lines, "(nenhum)")
             else
                 for _, attr in ipairs(attrs) do
                     table.insert(lines, attr .. " = " .. tostring(d:GetAttribute(attr)))
                 end
             end
+            table.insert(lines, "")
             table.insert(lines, "--- Filhos ---")
             for _, c in ipairs(d:GetChildren()) do
                 local val = ""
@@ -485,59 +567,44 @@ local function inspectFirstMob()
                 elseif c:IsA("NumberValue") or c:IsA("IntValue") then val = " = " .. c.Value
                 elseif c:IsA("BoolValue") then val = " = " .. tostring(c.Value)
                 end
-                table.insert(lines, c.ClassName .. ": " .. c.Name .. val)
+                table.insert(lines, "[" .. c.ClassName .. "] " .. c.Name .. val)
             end
+            table.insert(lines, "")
             table.insert(lines, "--- Humanoid ---")
             local hum = d:FindFirstChildOfClass("Humanoid")
             if hum then
                 table.insert(lines, "DisplayName: " .. hum.DisplayName)
                 table.insert(lines, "Health: " .. hum.Health .. "/" .. hum.MaxHealth)
             end
+            table.insert(lines, "")
+            table.insert(lines, "extractName() = " .. extractName(d))
+            table.insert(lines, "extractRank() = " .. extractRank(d))
             inspectBox.Text = table.concat(lines, "\n")
             setStatus("Inspeção na UI ✓")
-            print("========== INSPEÇÃO DE MOB ==========")
-            for _, l in ipairs(lines) do print(l) end
-            print("=====================================")
             return
         end
     end
-    inspectBox.Text = "Nenhum mob encontrado pra inspecionar."
+    inspectBox.Text = "Nenhum mob pra inspecionar."
 end
 
-makeButton("🔬 Inspecionar 1º Mob (mostra na UI)", inspectFirstMob)
+makeButton("🔬 Inspecionar 1º Mob (na UI)", inspectFirstMob)
 
-makeButton("📋 Listar Prompts (F9)", function()
-    local n = 0
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") then
-            n = n + 1
-            print("[Prompt] " .. (obj.Parent and obj.Parent.Name or "?") .. " | Action: " .. obj.ActionText)
-        end
-    end
-    setStatus("Prompts: " .. n)
-end)
-
--- ============================
--- PARAR TUDO
--- ============================
 makeSection("CONTROLE")
 
 makeButton("🛑 Parar Auto Farm", function()
     Config.AutoFarm = false
-    if autoFarmToggle.setState then autoFarmToggle.setState(false) end
+    State.CurrentTarget = nil
+    State.TargetTeleported = false
+    autoFarmToggle.setState(false)
+    autoFarmToggle.button.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    autoFarmToggle.button.Text = "✘  ⚔️ Ativar Auto Farm"
     setStatus("Auto Farm parado")
-end)
-
-makeButton("🛑 Parar Tudo (farm + dungeon)", function()
-    Config.AutoFarm = false
-    setStatus("Tudo parado")
 end)
 
 closeBtn.MouseButton1Click:Connect(function()
     Config.AutoFarm = false
     screenGui:Destroy()
-    print("[AutoFarm] Encerrado")
 end)
 
-print("[AutoFarm v7] Pronto!")
+print("[AutoFarm v9] Pronto!")
 setStatus("Clique em '🔍 Escanear Mobs'")
