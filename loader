@@ -722,4 +722,31 @@ makeButton(inspectPage, "🔬 Inspecionar 1º Mob (mostra 3)", function()
         if mob:IsA("Model") and count < 3 then
             count = count + 1
             table.insert(lines, "=== MOB " .. count .. " ===")
-            table.insert(lines, "Name: " ..
+            local mob = folder:GetChildren()[count]
+            -- pega o primeiro Model que encontrar
+            for _, m in ipairs(folder:GetChildren()) do
+                if m:IsA("Model") and m.Name ~= lastInspected then
+                    mob = m
+                    lastInspected = m.Name
+                    break
+                end
+            end
+            break
+        end
+    end
+    inspectBox.Text = table.concat(lines, "\n")
+    setStatus("Inspeção ✓")
+end)
+
+-- ============================
+-- FINALIZAÇÃO
+-- ============================
+switchTab("Auto Farm")
+
+closeBtn.MouseButton1Click:Connect(function()
+    Config.AutoFarm = false
+    screenGui:Destroy()
+end)
+
+print("[AutoFarm v13] Pronto!")
+setStatus("Clique em '🔍 Escanear Mobs'")
