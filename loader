@@ -1,8 +1,9 @@
 --[[
-    Auto Farm Pro v14 - Anime Eternal
-    - Nome e Rank REAIS lidos do BillboardGui do jogo
-    - UI arrastável + estética melhorada
-    - Auto Farm, RankUp, Stars, Quests (aceitar/completar/ir ao local)
+    Auto Farm Pro v15 - Anime Eternal
+    - Auto Farm com nomes reais (BillboardGui)
+    - Auto Clicker, Auto RankUp, Auto Prestígio
+    - Auto Alocar Pontos de Habilidade
+    - Quests: Auto Aceitar, Auto Completar, Auto Ir ao Local
 --]]
 
 local Players = game:GetService("Players")
@@ -15,19 +16,15 @@ local TweenService = game:GetService("TweenService")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-print("[AutoFarm v14] Iniciando...")
+print("[AutoFarm v15] Iniciando...")
 
--- ============================
--- CONSTANTES
--- ============================
 local RANK_ORDER = { ["E"]=1, ["D"]=2, ["C"]=3, ["B"]=4, ["A"]=5, ["S"]=6, ["SS"]=7, ["SSS"]=8, ["Boss"]=99 }
 local RANK_COLORS = {
     E=Color3.fromRGB(180,180,180), D=Color3.fromRGB(120,220,120),
     C=Color3.fromRGB(80,170,255), B=Color3.fromRGB(170,100,255),
     A=Color3.fromRGB(255,210,60), S=Color3.fromRGB(255,120,50),
     SS=Color3.fromRGB(255,50,150), SSS=Color3.fromRGB(255,0,0),
-    Boss=Color3.fromRGB(255,215,0),
-    ["?"]=Color3.fromRGB(150,150,150),
+    Boss=Color3.fromRGB(255,215,0), ["?"]=Color3.fromRGB(150,150,150),
 }
 
 local THEME = {
@@ -40,6 +37,7 @@ local THEME = {
     TEXT_DIM = Color3.fromRGB(150, 150, 165),
     SUCCESS = Color3.fromRGB(50, 190, 100),
     DANGER = Color3.fromRGB(220, 70, 70),
+    WARN = Color3.fromRGB(240, 180, 60),
 }
 
 local Config = {
@@ -47,6 +45,10 @@ local Config = {
     TeleportDistance = 5, AttackCooldown = 0.2,
     KillTimeout = 12, HpCheckInterval = 1.5,
     AutoRankUp = false, AutoStar1 = false, AutoStar2 = false,
+    AutoClicker = false, AutoClickerCPS = 100,
+    AutoPrestige = false,
+    AutoAllocPoints = false,
+    AllocPriority = "Dano",
     AutoAcceptQuest = false,
     AutoCompleteQuest = false,
     AutoTeleportQuest = false,
@@ -59,13 +61,10 @@ local State = {
     TargetStartTime = 0, LastHpCheck = 0,
     TargetTeleported = false, LastTargetHp = 0,
     CurrentQuest = nil,
-    QuestThread = nil,
-    AutoRefreshThread = nil,
+    ClickerThread = nil,
+    AllocThread = nil,
 }
 
--- ============================
--- REMOTE EVENT
--- ============================
 local function fireToServer(args)
     local events = ReplicatedStorage:FindFirstChild("Events")
     if not events then return false end
@@ -75,11 +74,6 @@ local function fireToServer(args)
     return true
 end
 
--- ============================
--- LER NOMES DOS BILLBOARDGUIS
--- ============================
--- Os BillboardGuis ficam em PlayerGui._Main_Folder.Workspace_GUI.<ID>
--- Cada um tem Adornee = HumanoidRootPart do mob
 local function getWorkspaceGuiFolder()
     local pg = LocalPlayer:FindFirstChild("PlayerGui")
     if not pg then return nil end
@@ -88,14 +82,12 @@ local function getWorkspaceGuiFolder()
     return main:FindFirstChild("Workspace_GUI")
 end
 
--- Extrai nome e rank do BillboardGui e devolve o mob associado
 local function parseBillboard(bg)
     if not bg or not bg.Adornee then return nil end
     local main = bg:FindFirstChild("Main")
     if not main then return nil end
     local nameLbl = main:FindFirstChild("Monster_Name")
     if not nameLbl or nameLbl.Text == "" or nameLbl.Text == "Monster Name" then return nil end
-    
     local rank = "?"
     local rankFrame = main:FindFirstChild("Monster_Rank")
     if rankFrame then
@@ -106,27 +98,14 @@ local function parseBillboard(bg)
             end
         end
     end
-    
-    -- Sobe até encontrar o Model do mob (Adornee é HumanoidRootPart)
     local mob = bg.Adornee
-    while mob and not mob:IsA("Model") do
-        mob = mob.Parent
-    end
+    while mob and not mob:IsA("Model") do mob = mob.Parent end
     if not mob then return nil end
-    
-    -- Verifica se está vivo
     local h = mob:FindFirstChildOfClass("Humanoid")
     if not h or h.Health <= 0 then return nil end
-    
-    return {
-        mob = mob,
-        humanoid = h,
-        name = nameLbl.Text,
-        rank = rank:upper(),
-    }
+    return { mob = mob, humanoid = h, name = nameLbl.Text, rank = rank:upper() }
 end
 
--- Escaneia todos os BillboardGuis e devolve uma lista agrupada por nome+rank
 local function scanMobs()
     local t0 = tick()
     local folder = getWorkspaceGuiFolder()
@@ -134,7 +113,6 @@ local function scanMobs()
         print("[AutoFarm] Workspace_GUI não encontrado")
         return {}, 0
     end
-    
     local mobTypes = {}
     local totalFound = 0
     for _, bg in ipairs(folder:GetChildren()) do
@@ -144,20 +122,13 @@ local function scanMobs()
                 totalFound = totalFound + 1
                 local key = data.name .. " [" .. data.rank .. "]"
                 if not mobTypes[key] then
-                    mobTypes[key] = {
-                        name = data.name,
-                        rank = data.rank,
-                        key = key,
-                        count = 0,
-                        examples = {},  -- lista de {mob, humanoid}
-                    }
+                    mobTypes[key] = { name = data.name, rank = data.rank, key = key, count = 0, examples = {} }
                 end
                 mobTypes[key].count = mobTypes[key].count + 1
                 table.insert(mobTypes[key].examples, data)
             end
         end
     end
-    
     local list = {}
     for _, data in pairs(mobTypes) do table.insert(list, data) end
     table.sort(list, function(a,b)
@@ -166,20 +137,13 @@ local function scanMobs()
         if ra ~= rb then return ra < rb end
         return a.name < b.name
     end)
-    
     State.MobCache = mobTypes
     State.MobList = list
     local elapsed = math.floor((tick() - t0) * 100) / 100
     print("[AutoFarm] Scan: " .. totalFound .. " mobs, " .. #list .. " tipos (" .. elapsed .. "s)")
-    for _, d in ipairs(list) do
-        print("  - [" .. d.rank .. "] " .. d.name .. " (" .. d.count .. "x)")
-    end
     return list, totalFound
 end
 
--- ============================
--- ATAQUE
--- ============================
 local function attackMob(mob, humanoid)
     if not mob or not mob.PrimaryPart or not humanoid then return end
     if humanoid.Health <= 0 then return end
@@ -194,7 +158,6 @@ local function attackMob(mob, humanoid)
         VirtualUser:Button1Up(Vector2.new(0,0))
     end)
 end
-
 -- ============================
 -- AUTO FARM LOOP
 -- ============================
@@ -277,7 +240,23 @@ local function autoFarmLoop()
 end
 
 -- ============================
--- LOOPS EXTRAS
+-- AUTO CLICKER
+-- ============================
+task.spawn(function()
+    while true do
+        local delay = 1 / math.max(1, Config.AutoClickerCPS)
+        if Config.AutoClicker then
+            pcall(function()
+                VirtualUser:Button1Down(Vector2.new(0,0))
+                VirtualUser:Button1Up(Vector2.new(0,0))
+            end)
+        end
+        task.wait(delay)
+    end
+end)
+
+-- ============================
+-- AUTO RANKUP / STARS / PRESTIGE
 -- ============================
 task.spawn(function()
     while true do
@@ -287,6 +266,7 @@ task.spawn(function()
         end
     end
 end)
+
 task.spawn(function()
     while true do
         task.wait(1)
@@ -295,11 +275,59 @@ task.spawn(function()
         end
     end
 end)
+
 task.spawn(function()
     while true do
         task.wait(1)
         if Config.AutoStar2 then
             fireToServer({{["Open_Amount"]=5,["Action"]="_Stars",["Name"]="Star_2"}})
+        end
+    end
+end)
+
+-- Auto Prestígio (tenta 4 variações)
+task.spawn(function()
+    while true do
+        task.wait(2)
+        if Config.AutoPrestige then
+            fireToServer({{["Upgrading_Name"]="Prestige",["Action"]="_Upgrades",["Upgrade_Name"]="Prestige_Up"}})
+            task.wait(0.3)
+            fireToServer({{["Upgrading_Name"]="Prestige",["Action"]="_Upgrades",["Upgrade_Name"]="Prestige"}})
+            task.wait(0.3)
+            fireToServer({{["Upgrading_Name"]="Prestígio",["Action"]="_Upgrades",["Upgrade_Name"]="Prestígio_Up"}})
+            task.wait(0.3)
+            fireToServer({{["Upgrading_Name"]="Rebirth",["Action"]="_Upgrades",["Upgrade_Name"]="Rebirth_Up"}})
+        end
+    end
+end)
+
+-- ============================
+-- AUTO ALOCAR PONTOS
+-- ============================
+local STAT_NAMES = {
+    ["Dano"] = "Damage",
+    ["Energia"] = "Energy",
+    ["Moedas"] = "Coins",
+    ["Sorte Estelar"] = "StarLuck",
+}
+
+local function allocPoint(statName)
+    local upgradeName = STAT_NAMES[statName] or statName
+    fireToServer({{["Action"]="_Upgrades",["Upgrade_Name"]=upgradeName}})
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if Config.AutoAllocPoints then
+            if Config.AllocPriority == "Balanceado" then
+                allocPoint("Dano")
+                allocPoint("Energia")
+                allocPoint("Moedas")
+                allocPoint("Sorte Estelar")
+            else
+                allocPoint(Config.AllocPriority)
+            end
         end
     end
 end)
@@ -318,7 +346,6 @@ local function startQuest(id)
     end)
 end
 
--- Auto aceitar quest quando a anterior completa
 task.spawn(function()
     while true do
         task.wait(2)
@@ -328,7 +355,6 @@ task.spawn(function()
     end
 end)
 
--- Auto teleportar pro local da quest
 task.spawn(function()
     while true do
         task.wait(1)
@@ -340,7 +366,6 @@ task.spawn(function()
                         local main = bg:FindFirstChild("Main")
                         local nameLbl = main and main:FindFirstChild("Monster_Name")
                         if nameLbl and nameLbl.Text ~= "" then
-                            -- Se bate com a keyword da quest, teleporta até
                             local kw = Config.QuestMobKeyword
                             if kw == "" or nameLbl.Text:lower():find(kw:lower()) then
                                 local mob = bg.Adornee
@@ -360,7 +385,6 @@ task.spawn(function()
         end
     end
 end)
-
 -- ============================
 -- UI
 -- ============================
@@ -378,14 +402,12 @@ mainFrame.BorderSizePixel = 0
 mainFrame.Active = false
 mainFrame.Draggable = false
 mainFrame.Parent = screenGui
-local mainCorner = Instance.new("UICorner", mainFrame)
-mainCorner.CornerRadius = UDim.new(0, 12)
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
 local mainStroke = Instance.new("UIStroke", mainFrame)
 mainStroke.Color = THEME.ACCENT
 mainStroke.Thickness = 1.5
 mainStroke.Transparency = 0.5
 
--- Drag manual (funciona em qualquer executor)
 local dragging, dragStart, startPos
 local function makeDragHandle(handle)
     handle.InputBegan:Connect(function(input)
@@ -406,7 +428,6 @@ local function makeDragHandle(handle)
     end)
 end
 
--- Top bar com gradient
 local topBar = Instance.new("Frame")
 topBar.Size = UDim2.new(1, 0, 0, 48)
 topBar.BackgroundColor3 = THEME.ACCENT
@@ -430,10 +451,10 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -60, 1, 0)
 title.Position = UDim2.new(0, 16, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "⚔️  AUTO FARM PRO  •  Anime Eternal"
+title.Text = "⚔️  AUTO FARM PRO v15  •  Anime Eternal"
 title.TextColor3 = Color3.fromRGB(255,255,255)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 15
+title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = topBar
 
@@ -450,7 +471,6 @@ closeBtn.AutoButtonColor = false
 closeBtn.Parent = topBar
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8)
 
--- Tab bar
 local tabBar = Instance.new("Frame")
 tabBar.Size = UDim2.new(1, -24, 0, 36)
 tabBar.Position = UDim2.new(0, 12, 0, 58)
@@ -508,12 +528,12 @@ end
 
 local function createTab(tabName)
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0, 140, 0, 28)
+    btn.Size = UDim2.new(0, 118, 0, 28)
     btn.BackgroundColor3 = THEME.PANEL
     btn.Text = tabName
     btn.TextColor3 = THEME.TEXT_DIM
     btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 12
+    btn.TextSize = 11
     btn.BorderSizePixel = 0
     btn.AutoButtonColor = false
     btn.Parent = tabBar
@@ -560,7 +580,6 @@ local function makeButton(parent, text, callback)
     b.AutoButtonColor = false
     b.Parent = parent
     Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
-    
     b.MouseEnter:Connect(function()
         TweenService:Create(b, TweenInfo.new(0.15), {BackgroundColor3 = THEME.PANEL_HOVER}):Play()
     end)
@@ -613,6 +632,128 @@ local function makeToggle(parent, text, initial, callback)
     }
 end
 
+local function makeSlider(parent, text, min, max, initial, suffix, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 60)
+    frame.BackgroundColor3 = THEME.PANEL
+    frame.BorderSizePixel = 0
+    frame.Parent = parent
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -20, 0, 20)
+    lbl.Position = UDim2.new(0, 10, 0, 6)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text .. ": " .. initial .. (suffix or "")
+    lbl.TextColor3 = THEME.TEXT
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = frame
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, -20, 0, 8)
+    bar.Position = UDim2.new(0, 10, 0, 34)
+    bar.BackgroundColor3 = THEME.BG
+    bar.BorderSizePixel = 0
+    bar.Parent = frame
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(1, 0)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((initial - min) / (max - min), 0, 1, 0)
+    fill.BackgroundColor3 = THEME.ACCENT
+    fill.BorderSizePixel = 0
+    fill.Parent = bar
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+    local dragging = false
+    local function updateFromX(x)
+        local rel = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+        local val = math.floor(min + (max - min) * rel)
+        fill.Size = UDim2.new(rel, 0, 1, 0)
+        lbl.Text = text .. ": " .. val .. (suffix or "")
+        callback(val)
+    end
+
+    bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            updateFromX(input.Position.X)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            updateFromX(input.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+local function makeDropdown(parent, text, options, initial, callback)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 0)
+    container.BackgroundColor3 = THEME.PANEL
+    container.BorderSizePixel = 0
+    container.AutomaticSize = Enum.AutomaticSize.Y
+    container.Parent = parent
+    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 8)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -16, 0, 26)
+    lbl.Position = UDim2.new(0, 8, 0, 4)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text .. ": " .. initial
+    lbl.TextColor3 = THEME.TEXT
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = container
+
+    local expanded = false
+    local optBtns = {}
+    local function render()
+        for _, b in ipairs(optBtns) do b:Destroy() end
+        optBtns = {}
+        if not expanded then return end
+        for _, opt in ipairs(options) do
+            local ob = Instance.new("TextButton")
+            ob.Size = UDim2.new(1, -16, 0, 28)
+            ob.BackgroundColor3 = THEME.BG
+            ob.Text = "  " .. opt
+            ob.TextColor3 = THEME.TEXT
+            ob.Font = Enum.Font.Gotham
+            ob.TextSize = 12
+            ob.BorderSizePixel = 0
+            ob.AutoButtonColor = false
+            ob.TextXAlignment = Enum.TextXAlignment.Left
+            ob.Parent = container
+            Instance.new("UICorner", ob).CornerRadius = UDim.new(0, 6)
+            ob.MouseButton1Click:Connect(function()
+                lbl.Text = text .. ": " .. opt
+                callback(opt)
+                expanded = false
+                render()
+            end)
+            table.insert(optBtns, ob)
+        end
+    end
+
+    local header = Instance.new("TextButton")
+    header.Size = UDim2.new(1, -16, 0, 26)
+    header.Position = UDim2.new(0, 8, 0, 4)
+    header.BackgroundTransparency = 1
+    header.Text = ""
+    header.Parent = container
+    header.MouseButton1Click:Connect(function()
+        expanded = not expanded
+        render()
+    end)
+end
+
 -- ============================
 -- ABA 1: AUTO FARM
 -- ============================
@@ -658,8 +799,7 @@ function populateDropdown()
     for _, data in ipairs(State.MobList) do
         local mobBtn = Instance.new("TextButton")
         mobBtn.Size = UDim2.new(1, -16, 0, 32)
-        mobBtn.BackgroundColor3 = (Config.SelectedMob == data.key)
-            and THEME.ACCENT or THEME.BG
+        mobBtn.BackgroundColor3 = (Config.SelectedMob == data.key) and THEME.ACCENT or THEME.BG
         mobBtn.Text = "  [" .. data.rank .. "]   " .. data.name .. "    (" .. data.count .. "x)"
         mobBtn.TextColor3 = RANK_COLORS[data.rank] or THEME.TEXT
         mobBtn.Font = Enum.Font.GothamSemibold
@@ -709,20 +849,51 @@ makeButton(farmPage, "🛑  Parar Auto Farm", function()
 end)
 
 -- ============================
--- ABA 2: UPGRADES
+-- ABA 2: PLAYER
 -- ============================
-local upPage = createTab("Upgrades")
-makeSection(upPage, "RANK UP")
-makeToggle(upPage, "⬆️  Auto RankUp", false, function(state)
+local playerPage = createTab("Player")
+
+makeSection(playerPage, "AUTO CLICKER")
+makeToggle(playerPage, "🖱️  Ativar Auto Clicker", false, function(state)
+    Config.AutoClicker = state
+    setStatus("Auto Clicker: " .. (state and "ON" or "OFF"))
+end)
+makeSlider(playerPage, "Velocidade", 10, 200, Config.AutoClickerCPS, " CPS", function(v)
+    Config.AutoClickerCPS = v
+end)
+
+makeSection(playerPage, "UPGRADES")
+makeToggle(playerPage, "⬆️  Auto RankUp", false, function(state)
     Config.AutoRankUp = state
     setStatus("Auto RankUp: " .. (state and "ON" or "OFF"))
 end)
-makeSection(upPage, "STARS")
-makeToggle(upPage, "⭐  Auto Open Star 1", false, function(state)
+makeToggle(playerPage, "🌟  Auto Prestígio (testa 4 nomes)", false, function(state)
+    Config.AutoPrestige = state
+    setStatus("Auto Prestígio: " .. (state and "ON" or "OFF"))
+end)
+
+makeSection(playerPage, "PONTOS DE HABILIDADE")
+makeDropdown(playerPage, "Prioridade", {"Dano","Energia","Moedas","Sorte Estelar","Balanceado"}, "Dano", function(opt)
+    Config.AllocPriority = opt
+end)
+makeToggle(playerPage, "🎯  Auto Alocar Pontos", false, function(state)
+    Config.AutoAllocPoints = state
+    setStatus("Auto Alocar: " .. (state and "ON" or "OFF"))
+end)
+makeButton(playerPage, "➕  Dar +1 em cada stat (manual)", function()
+    allocPoint("Dano")
+    allocPoint("Energia")
+    allocPoint("Moedas")
+    allocPoint("Sorte Estelar")
+    setStatus("Tentou dar +1 em todos os stats")
+end)
+
+makeSection(playerPage, "STARS")
+makeToggle(playerPage, "⭐  Auto Open Star 1", false, function(state)
     Config.AutoStar1 = state
     setStatus("Star 1: " .. (state and "ON" or "OFF"))
 end)
-makeToggle(upPage, "🌟  Auto Open Star 2", false, function(state)
+makeToggle(playerPage, "🌟  Auto Open Star 2", false, function(state)
     Config.AutoStar2 = state
     setStatus("Star 2: " .. (state and "ON" or "OFF"))
 end)
@@ -733,29 +904,23 @@ end)
 local qPage = createTab("Quests")
 
 makeSection(qPage, "AÇÕES")
-
 makeToggle(qPage, "📜  Auto Aceitar Quest", false, function(state)
     Config.AutoAcceptQuest = state
     setStatus("Auto Aceitar: " .. (state and "ON" or "OFF"))
 end)
-
 makeToggle(qPage, "✅  Auto Completar Quest", false, function(state)
     Config.AutoCompleteQuest = state
-    if state then
-        -- Liga o Auto Farm automaticamente
-        setStatus("Auto Completar ativo (Auto Farm ligado)")
-    end
+    setStatus("Auto Completar: " .. (state and "ON" or "OFF"))
 end)
-
 makeToggle(qPage, "🚀  Auto Ir ao Local da Quest", false, function(state)
     Config.AutoTeleportQuest = state
     setStatus("Auto Teleporte: " .. (state and "ON" or "OFF"))
 end)
 
 makeSection(qPage, "FILTRO DE MOB DA QUEST")
-makeButton(qPage, "✏️  Definir palavra-chave (F9 mostra)", function()
-    print("[AutoFarm] Digite o nome do mob da quest no chat ou edite Config.QuestMobKeyword")
-    print("[AutoFarm] Palavra atual: '" .. Config.QuestMobKeyword .. "'")
+makeButton(qPage, "✏️  Info da keyword", function()
+    print("[AutoFarm] Keyword atual: '" .. Config.QuestMobKeyword .. "'")
+    setStatus("Veja o F9")
 end)
 
 makeSection(qPage, "QUESTS MANUAIS — WORLD 1")
@@ -784,22 +949,27 @@ infoBox.Size = UDim2.new(1, 0, 0, 0)
 infoBox.BackgroundColor3 = THEME.PANEL
 infoBox.BorderSizePixel = 0
 infoBox.Text = [[
-⚔️  AUTO FARM PRO v14
+⚔️  AUTO FARM PRO v15
 
-▸ Como usar:
-  1. Vá para uma área com mobs
-  2. Clique em "Escanear Mobs"
-  3. Escolha o mob no dropdown
-  4. Ative o Auto Farm
+▸ Auto Farm:
+  1. Escaneie os mobs
+  2. Escolha o nome+rank no dropdown
+  3. Ative o toggle
+
+▸ Player:
+  • Auto Clicker (100 CPS padrão)
+  • Auto RankUp / Prestígio
+  • Auto Alocar Pontos (com prioridade)
+  • Auto Stars
 
 ▸ Quests:
-  • Auto Aceitar: aceita a quest seguinte quando a atual completa
-  • Auto Completar: liga o Auto Farm automaticamente
-  • Auto Ir ao Local: teleporta até o mob da quest
+  • Auto Aceitar (aceita a próxima)
+  • Auto Completar
+  • Auto Ir ao Local (teleporta até o mob)
 
 ▸ Dica:
-  Use a keyword da quest no filtro pra teleportar
-  até o mob certo automaticamente.
+  Use o dropdown de prioridade pra alocar
+  pontos no stat que você quer.
 
 ▸ Créditos:
   Feito para Anime Eternal
@@ -824,10 +994,10 @@ switchTab("Auto Farm")
 
 closeBtn.MouseButton1Click:Connect(function()
     Config.AutoFarm = false
+    Config.AutoClicker = false
     screenGui:Destroy()
 end)
 
--- Auto refresh a cada 5s se a UI estiver aberta
 task.spawn(function()
     while screenGui and screenGui.Parent do
         task.wait(5)
@@ -842,5 +1012,5 @@ task.spawn(function()
     end
 end)
 
-print("[AutoFarm v14] Pronto!")
+print("[AutoFarm v15] Pronto!")
 setStatus("Pronto!")
