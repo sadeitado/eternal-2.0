@@ -1,8 +1,8 @@
 --[[
-    Auto Farm Pro v13 - Anime Eternal
-    - UI arrastável (drag manual, funciona em qualquer executor)
-    - Agrupamento de mobs por PREFIXO do ID
-    - Auto RankUp, Auto Stars, Auto Quests, Inspeção
+    Auto Farm Pro v14 - Anime Eternal
+    - Nome e Rank REAIS lidos do BillboardGui do jogo
+    - UI arrastável + estética melhorada
+    - Auto Farm, RankUp, Stars, Quests (aceitar/completar/ir ao local)
 --]]
 
 local Players = game:GetService("Players")
@@ -10,22 +10,36 @@ local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
 local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-print("[AutoFarm v13] Iniciando...")
+print("[AutoFarm v14] Iniciando...")
 
 -- ============================
 -- CONSTANTES
 -- ============================
-local RANK_ORDER = { ["E"]=1, ["D"]=2, ["C"]=3, ["B"]=4, ["A"]=5, ["S"]=6, ["SS"]=7, ["SSS"]=8 }
+local RANK_ORDER = { ["E"]=1, ["D"]=2, ["C"]=3, ["B"]=4, ["A"]=5, ["S"]=6, ["SS"]=7, ["SSS"]=8, ["Boss"]=99 }
 local RANK_COLORS = {
     E=Color3.fromRGB(180,180,180), D=Color3.fromRGB(120,220,120),
-    C=Color3.fromRGB(100,170,255), B=Color3.fromRGB(180,110,255),
+    C=Color3.fromRGB(80,170,255), B=Color3.fromRGB(170,100,255),
     A=Color3.fromRGB(255,210,60), S=Color3.fromRGB(255,120,50),
     SS=Color3.fromRGB(255,50,150), SSS=Color3.fromRGB(255,0,0),
-    ["?"]=Color3.fromRGB(200,200,200),
+    Boss=Color3.fromRGB(255,215,0),
+    ["?"]=Color3.fromRGB(150,150,150),
+}
+
+local THEME = {
+    BG = Color3.fromRGB(18, 18, 24),
+    PANEL = Color3.fromRGB(28, 28, 36),
+    PANEL_HOVER = Color3.fromRGB(40, 40, 52),
+    ACCENT = Color3.fromRGB(88, 130, 255),
+    ACCENT_2 = Color3.fromRGB(150, 90, 255),
+    TEXT = Color3.fromRGB(240, 240, 245),
+    TEXT_DIM = Color3.fromRGB(150, 150, 165),
+    SUCCESS = Color3.fromRGB(50, 190, 100),
+    DANGER = Color3.fromRGB(220, 70, 70),
 }
 
 local Config = {
@@ -33,6 +47,10 @@ local Config = {
     TeleportDistance = 5, AttackCooldown = 0.2,
     KillTimeout = 12, HpCheckInterval = 1.5,
     AutoRankUp = false, AutoStar1 = false, AutoStar2 = false,
+    AutoAcceptQuest = false,
+    AutoCompleteQuest = false,
+    AutoTeleportQuest = false,
+    QuestMobKeyword = "",
 }
 
 local State = {
@@ -41,6 +59,8 @@ local State = {
     TargetStartTime = 0, LastHpCheck = 0,
     TargetTeleported = false, LastTargetHp = 0,
     CurrentQuest = nil,
+    QuestThread = nil,
+    AutoRefreshThread = nil,
 }
 
 -- ============================
@@ -56,137 +76,103 @@ local function fireToServer(args)
 end
 
 -- ============================
--- PASTA DE MOBS
+-- LER NOMES DOS BILLBOARDGUIS
 -- ============================
-local function getMobFolder()
-    local debris = Workspace:FindFirstChild("Debris")
-    if debris then
-        local m = debris:FindFirstChild("Monsters")
-        if m then return m end
-    end
-    for _, name in ipairs({"Monsters","Mobs","Enemies"}) do
-        local f = Workspace:FindFirstChild(name)
-        if f then return f end
-    end
-    return nil
+-- Os BillboardGuis ficam em PlayerGui._Main_Folder.Workspace_GUI.<ID>
+-- Cada um tem Adornee = HumanoidRootPart do mob
+local function getWorkspaceGuiFolder()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local main = pg:FindFirstChild("_Main_Folder")
+    if not main then return nil end
+    return main:FindFirstChild("Workspace_GUI")
 end
 
--- ============================
--- UTILS
--- ============================
-local function looksLikeId(s)
-    if #s < 20 then return false end
-    local numeric = 0
-    for i = 1, #s do
-        local c = s:sub(i,i)
-        if c:match("%d") or c == "-" then numeric = numeric + 1 end
-    end
-    return (numeric / #s) > 0.4
-end
-
--- Extrai o "tipo" do mob: se for ID tipo "0a75-2e1c84a1a75df17...", pega o prefixo antes do hífen
--- Se não, retorna o nome normal
-local function extractType(mob)
-    local name = mob.Name
-    -- Formato: "XXXX-XXXXXXXXXXXXXXXXXXXXXXXX"
-    local prefix = name:match("^(%x+)%-%x+$")
-    if prefix then
-        return prefix:upper()  -- ex: "0A75"
-    end
-    -- Formato com espaço: "0a75 2e1c..."
-    prefix = name:match("^(%x+)%s")
-    if prefix then return prefix:upper() end
-    -- Senão usa o nome limpo
-    return name:gsub("%s*%(%d+%)$", ""):gsub("%s*%([EDCBAS]+%)$", "")
-end
-
-local function extractRank(mob)
-    for _, attr in ipairs(mob:GetAttributes()) do
-        local val = mob:GetAttribute(attr)
-        if type(val) == "string" and RANK_ORDER[val:upper()] then return val:upper() end
-    end
-    for _, child in ipairs(mob:GetChildren()) do
-        if child:IsA("StringValue") and RANK_ORDER[child.Value:upper()] then
-            return child.Value:upper()
-        end
-    end
-    local fromName = mob.Name:match("%(([EDCBAS]+)%)") or mob.Name:match("[%s_%-]([EDCBAS]+)$")
-    if fromName and RANK_ORDER[fromName:upper()] then return fromName:upper() end
-    return "?"
-end
-
-local function extractName(mob)
-    -- Se o nome é ID, tenta achar em atributos/filhos
-    local hum = mob:FindFirstChildOfClass("Humanoid")
-    if hum and hum.DisplayName and hum.DisplayName ~= "" and not looksLikeId(hum.DisplayName) then
-        return hum.DisplayName
-    end
-    for _, child in ipairs(mob:GetChildren()) do
-        if child:IsA("StringValue") and not looksLikeId(child.Value) and #child.Value > 0 and #child.Value < 40 then
-            local cn = child.Name:lower()
-            if cn == "name" or cn == "mobname" or cn:find("displayname") then
-                return child.Value
+-- Extrai nome e rank do BillboardGui e devolve o mob associado
+local function parseBillboard(bg)
+    if not bg or not bg.Adornee then return nil end
+    local main = bg:FindFirstChild("Main")
+    if not main then return nil end
+    local nameLbl = main:FindFirstChild("Monster_Name")
+    if not nameLbl or nameLbl.Text == "" or nameLbl.Text == "Monster Name" then return nil end
+    
+    local rank = "?"
+    local rankFrame = main:FindFirstChild("Monster_Rank")
+    if rankFrame then
+        for _, sub in ipairs(rankFrame:GetDescendants()) do
+            if sub:IsA("TextLabel") and sub.Text ~= "" then
+                rank = sub.Text
+                break
             end
         end
     end
-    -- Fallback: nome do model
-    return mob.Name
+    
+    -- Sobe até encontrar o Model do mob (Adornee é HumanoidRootPart)
+    local mob = bg.Adornee
+    while mob and not mob:IsA("Model") do
+        mob = mob.Parent
+    end
+    if not mob then return nil end
+    
+    -- Verifica se está vivo
+    local h = mob:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 then return nil end
+    
+    return {
+        mob = mob,
+        humanoid = h,
+        name = nameLbl.Text,
+        rank = rank:upper(),
+    }
 end
 
-local function isAliveMob(instance)
-    if not instance or not instance.Parent then return false end
-    if not instance:IsA("Model") then return false end
-    local humanoid = instance:FindFirstChildOfClass("Humanoid")
-    if not humanoid or humanoid.Health <= 0 then return false end
-    if instance == LocalPlayer.Character then return false end
-    if Players:GetPlayerFromCharacter(instance) then return false end
-    return true, humanoid
-end
-
+-- Escaneia todos os BillboardGuis e devolve uma lista agrupada por nome+rank
 local function scanMobs()
     local t0 = tick()
-    local folder = getMobFolder()
+    local folder = getWorkspaceGuiFolder()
     if not folder then
-        print("[AutoFarm] Pasta de mobs não encontrada")
+        print("[AutoFarm] Workspace_GUI não encontrado")
         return {}, 0
     end
-    print("[AutoFarm] Pasta: " .. folder:GetFullName())
+    
     local mobTypes = {}
     local totalFound = 0
-    for _, d in ipairs(folder:GetChildren()) do
-        if isAliveMob(d) then
-            totalFound = totalFound + 1
-            -- 🔑 Agrupa por PREFIXO do ID
-            local mobType = extractType(d)
-            local rank = extractRank(d)
-            local key = mobType .. " [" .. rank .. "]"
-            if not mobTypes[key] then
-                mobTypes[key] = {
-                    name = mobType,
-                    rank = rank,
-                    key = key,
-                    count = 0,
-                    examples = {},
-                    sampleName = d.Name,  -- guarda 1 nome completo como exemplo
-                }
+    for _, bg in ipairs(folder:GetChildren()) do
+        if bg:IsA("BillboardGui") then
+            local data = parseBillboard(bg)
+            if data then
+                totalFound = totalFound + 1
+                local key = data.name .. " [" .. data.rank .. "]"
+                if not mobTypes[key] then
+                    mobTypes[key] = {
+                        name = data.name,
+                        rank = data.rank,
+                        key = key,
+                        count = 0,
+                        examples = {},  -- lista de {mob, humanoid}
+                    }
+                end
+                mobTypes[key].count = mobTypes[key].count + 1
+                table.insert(mobTypes[key].examples, data)
             end
-            mobTypes[key].count = mobTypes[key].count + 1
-            table.insert(mobTypes[key].examples, d)
         end
     end
+    
     local list = {}
     for _, data in pairs(mobTypes) do table.insert(list, data) end
     table.sort(list, function(a,b)
-        local ra = RANK_ORDER[a.rank] or 99
-        local rb = RANK_ORDER[b.rank] or 99
+        local ra = RANK_ORDER[a.rank] or 50
+        local rb = RANK_ORDER[b.rank] or 50
         if ra ~= rb then return ra < rb end
-        return a.count > b.count
+        return a.name < b.name
     end)
+    
     State.MobCache = mobTypes
     State.MobList = list
-    print("[AutoFarm] Scan: " .. totalFound .. " mobs, " .. #list .. " tipos (" .. math.floor((tick()-t0)*100)/100 .. "s)")
+    local elapsed = math.floor((tick() - t0) * 100) / 100
+    print("[AutoFarm] Scan: " .. totalFound .. " mobs, " .. #list .. " tipos (" .. elapsed .. "s)")
     for _, d in ipairs(list) do
-        print("  - [" .. d.rank .. "] " .. d.name .. " (" .. d.count .. "x)  ex: " .. d.sampleName)
+        print("  - [" .. d.rank .. "] " .. d.name .. " (" .. d.count .. "x)")
     end
     return list, totalFound
 end
@@ -248,13 +234,15 @@ local function autoFarmLoop()
         if needNewTarget then
             State.CurrentTarget = nil
             State.TargetTeleported = false
-            local closestMob, closestDist = nil, math.huge
-            for _, mob in ipairs(mobData.examples) do
-                if mob.Parent and isAliveMob(mob) and mob.PrimaryPart then
+            local closestMob, closestHumanoid, closestDist = nil, nil, math.huge
+            for _, entry in ipairs(mobData.examples) do
+                local mob = entry.mob
+                if mob and mob.Parent and entry.humanoid and entry.humanoid.Health > 0 and mob.PrimaryPart then
                     local dist = (myRoot.Position - mob.PrimaryPart.Position).Magnitude
                     if dist < closestDist then
                         closestDist = dist
                         closestMob = mob
+                        closestHumanoid = entry.humanoid
                     end
                 end
             end
@@ -316,6 +304,9 @@ task.spawn(function()
     end
 end)
 
+-- ============================
+-- QUESTS
+-- ============================
 local function startQuest(id)
     State.CurrentQuest = id
     local qnum = id:gsub("Q","")
@@ -327,6 +318,49 @@ local function startQuest(id)
     end)
 end
 
+-- Auto aceitar quest quando a anterior completa
+task.spawn(function()
+    while true do
+        task.wait(2)
+        if Config.AutoAcceptQuest and State.CurrentQuest then
+            fireToServer({{["Type"]="Next",["Action"]="_Quest"}})
+        end
+    end
+end)
+
+-- Auto teleportar pro local da quest
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if Config.AutoTeleportQuest then
+            local folder = getWorkspaceGuiFolder()
+            if folder then
+                for _, bg in ipairs(folder:GetChildren()) do
+                    if bg:IsA("BillboardGui") and bg.Adornee then
+                        local main = bg:FindFirstChild("Main")
+                        local nameLbl = main and main:FindFirstChild("Monster_Name")
+                        if nameLbl and nameLbl.Text ~= "" then
+                            -- Se bate com a keyword da quest, teleporta até
+                            local kw = Config.QuestMobKeyword
+                            if kw == "" or nameLbl.Text:lower():find(kw:lower()) then
+                                local mob = bg.Adornee
+                                while mob and not mob:IsA("Model") do mob = mob.Parent end
+                                if mob and mob.PrimaryPart then
+                                    local char = LocalPlayer.Character
+                                    if char and char:FindFirstChild("HumanoidRootPart") then
+                                        char.HumanoidRootPart.CFrame = mob.PrimaryPart.CFrame + Vector3.new(0, 3, 5)
+                                    end
+                                end
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
 -- ============================
 -- UI
 -- ============================
@@ -337,17 +371,21 @@ screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = PlayerGui
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 580, 0, 660)
-mainFrame.Position = UDim2.new(0.5, -290, 0.5, -330)
-mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+mainFrame.Size = UDim2.new(0, 600, 0, 680)
+mainFrame.Position = UDim2.new(0.5, -300, 0.5, -340)
+mainFrame.BackgroundColor3 = THEME.BG
 mainFrame.BorderSizePixel = 0
-mainFrame.Active = false       -- ⚠️ false para não roubar input
-mainFrame.Draggable = false    -- ⚠️ drag manual
+mainFrame.Active = false
+mainFrame.Draggable = false
 mainFrame.Parent = screenGui
-Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
-Instance.new("UIStroke", mainFrame).Color = Color3.fromRGB(60, 120, 220)
+local mainCorner = Instance.new("UICorner", mainFrame)
+mainCorner.CornerRadius = UDim.new(0, 12)
+local mainStroke = Instance.new("UIStroke", mainFrame)
+mainStroke.Color = THEME.ACCENT
+mainStroke.Thickness = 1.5
+mainStroke.Transparency = 0.5
 
--- ⚠️ SISTEMA DE DRAG MANUAL (funciona em qualquer executor)
+-- Drag manual (funciona em qualquer executor)
 local dragging, dragStart, startPos
 local function makeDragHandle(handle)
     handle.InputBegan:Connect(function(input)
@@ -356,9 +394,7 @@ local function makeDragHandle(handle)
             dragStart = input.Position
             startPos = mainFrame.Position
             input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
             end)
         end
     end)
@@ -370,29 +406,41 @@ local function makeDragHandle(handle)
     end)
 end
 
+-- Top bar com gradient
 local topBar = Instance.new("Frame")
-topBar.Size = UDim2.new(1, 0, 0, 45)
-topBar.BackgroundColor3 = Color3.fromRGB(40, 90, 180)
+topBar.Size = UDim2.new(1, 0, 0, 48)
+topBar.BackgroundColor3 = THEME.ACCENT
 topBar.BorderSizePixel = 0
 topBar.Parent = mainFrame
 Instance.new("UICorner", topBar).CornerRadius = UDim.new(0, 12)
-makeDragHandle(topBar)  -- ⚠️ registra drag no topBar
+local topFix = Instance.new("Frame")
+topFix.Size = UDim2.new(1, 0, 0, 12)
+topFix.Position = UDim2.new(0, 0, 1, -12)
+topFix.BackgroundColor3 = THEME.ACCENT
+topFix.BorderSizePixel = 0
+topFix.Parent = topBar
+local topGradient = Instance.new("UIGradient", topBar)
+topGradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, THEME.ACCENT),
+    ColorSequenceKeypoint.new(1, THEME.ACCENT_2),
+})
+makeDragHandle(topBar)
 
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -70, 1, 0)
-title.Position = UDim2.new(0, 15, 0, 0)
+title.Size = UDim2.new(1, -60, 1, 0)
+title.Position = UDim2.new(0, 16, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "⚔️ AUTO FARM PRO v13 - Anime Eternal"
+title.Text = "⚔️  AUTO FARM PRO  •  Anime Eternal"
 title.TextColor3 = Color3.fromRGB(255,255,255)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 14
+title.TextSize = 15
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = topBar
 
 local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.new(0, 30, 0, 30)
-closeBtn.Position = UDim2.new(1, -38, 0, 8)
-closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+closeBtn.Size = UDim2.new(0, 32, 0, 32)
+closeBtn.Position = UDim2.new(1, -40, 0, 8)
+closeBtn.BackgroundColor3 = THEME.DANGER
 closeBtn.Text = "✕"
 closeBtn.TextColor3 = Color3.fromRGB(255,255,255)
 closeBtn.Font = Enum.Font.GothamBold
@@ -400,15 +448,16 @@ closeBtn.TextSize = 16
 closeBtn.BorderSizePixel = 0
 closeBtn.AutoButtonColor = false
 closeBtn.Parent = topBar
-Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8)
 
+-- Tab bar
 local tabBar = Instance.new("Frame")
-tabBar.Size = UDim2.new(1, -20, 0, 34)
-tabBar.Position = UDim2.new(0, 10, 0, 50)
-tabBar.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+tabBar.Size = UDim2.new(1, -24, 0, 36)
+tabBar.Position = UDim2.new(0, 12, 0, 58)
+tabBar.BackgroundColor3 = THEME.PANEL
 tabBar.BorderSizePixel = 0
 tabBar.Parent = mainFrame
-Instance.new("UICorner", tabBar).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", tabBar).CornerRadius = UDim.new(0, 10)
 
 local tabLayout = Instance.new("UIListLayout", tabBar)
 tabLayout.FillDirection = Enum.FillDirection.Horizontal
@@ -418,29 +467,32 @@ tabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
 Instance.new("UIPadding", tabBar).PaddingLeft = UDim.new(0, 4)
 
 local content = Instance.new("ScrollingFrame")
-content.Size = UDim2.new(1, -20, 1, -140)
-content.Position = UDim2.new(0, 10, 0, 90)
+content.Size = UDim2.new(1, -24, 1, -160)
+content.Position = UDim2.new(0, 12, 0, 102)
 content.BackgroundTransparency = 1
 content.BorderSizePixel = 0
 content.ScrollBarThickness = 4
+content.ScrollBarImageColor3 = THEME.ACCENT
 content.CanvasSize = UDim2.new(0, 0, 0, 0)
 content.AutomaticCanvasSize = Enum.AutomaticSize.Y
 content.Parent = mainFrame
 
 local statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.new(1, -20, 0, 24)
-statusLabel.Position = UDim2.new(0, 10, 1, -30)
-statusLabel.BackgroundTransparency = 1
-statusLabel.Text = "Status: Carregado"
-statusLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
+statusLabel.Size = UDim2.new(1, -24, 0, 28)
+statusLabel.Position = UDim2.new(0, 12, 1, -36)
+statusLabel.BackgroundColor3 = THEME.PANEL
+statusLabel.BorderSizePixel = 0
+statusLabel.Text = "  Status: Carregado"
+statusLabel.TextColor3 = THEME.TEXT_DIM
 statusLabel.Font = Enum.Font.Gotham
 statusLabel.TextSize = 12
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.Parent = mainFrame
+Instance.new("UICorner", statusLabel).CornerRadius = UDim.new(0, 8)
 
 local function setStatus(txt)
     print("[AutoFarm] Status: " .. txt)
-    statusLabel.Text = "Status: " .. txt
+    statusLabel.Text = "  Status: " .. txt
 end
 
 local pages = {}
@@ -449,17 +501,18 @@ local tabButtons = {}
 local function switchTab(tabName)
     for name, frame in pairs(pages) do frame.Visible = (name == tabName) end
     for name, btn in pairs(tabButtons) do
-        btn.BackgroundColor3 = (name == tabName) and Color3.fromRGB(40, 90, 180) or Color3.fromRGB(45, 45, 55)
+        btn.BackgroundColor3 = (name == tabName) and THEME.ACCENT or THEME.PANEL
+        btn.TextColor3 = (name == tabName) and Color3.fromRGB(255,255,255) or THEME.TEXT_DIM
     end
 end
 
 local function createTab(tabName)
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0, 130, 0, 26)
-    btn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    btn.Size = UDim2.new(0, 140, 0, 28)
+    btn.BackgroundColor3 = THEME.PANEL
     btn.Text = tabName
-    btn.TextColor3 = Color3.fromRGB(240, 240, 240)
-    btn.Font = Enum.Font.GothamSemibold
+    btn.TextColor3 = THEME.TEXT_DIM
+    btn.Font = Enum.Font.GothamBold
     btn.TextSize = 12
     btn.BorderSizePixel = 0
     btn.AutoButtonColor = false
@@ -484,10 +537,10 @@ end
 
 local function makeSection(parent, text)
     local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1, 0, 0, 24)
+    l.Size = UDim2.new(1, 0, 0, 26)
     l.BackgroundTransparency = 1
-    l.Text = "▸ " .. text
-    l.TextColor3 = Color3.fromRGB(120, 180, 255)
+    l.Text = "▸  " .. text
+    l.TextColor3 = THEME.ACCENT
     l.Font = Enum.Font.GothamBold
     l.TextSize = 12
     l.TextXAlignment = Enum.TextXAlignment.Left
@@ -497,16 +550,23 @@ end
 
 local function makeButton(parent, text, callback)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(1, 0, 0, 34)
-    b.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    b.Size = UDim2.new(1, 0, 0, 36)
+    b.BackgroundColor3 = THEME.PANEL
     b.Text = text
-    b.TextColor3 = Color3.fromRGB(240, 240, 240)
+    b.TextColor3 = THEME.TEXT
     b.Font = Enum.Font.GothamSemibold
     b.TextSize = 13
     b.BorderSizePixel = 0
     b.AutoButtonColor = false
     b.Parent = parent
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    
+    b.MouseEnter:Connect(function()
+        TweenService:Create(b, TweenInfo.new(0.15), {BackgroundColor3 = THEME.PANEL_HOVER}):Play()
+    end)
+    b.MouseLeave:Connect(function()
+        TweenService:Create(b, TweenInfo.new(0.15), {BackgroundColor3 = THEME.PANEL}):Play()
+    end)
     b.MouseButton1Click:Connect(function()
         task.spawn(function()
             local ok, err = pcall(callback)
@@ -519,20 +579,22 @@ end
 local function makeToggle(parent, text, initial, callback)
     local state = initial
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(1, 0, 0, 34)
-    b.BackgroundColor3 = state and Color3.fromRGB(0, 150, 80) or Color3.fromRGB(45, 45, 55)
-    b.Text = (state and "✔  " or "✘  ") .. text
-    b.TextColor3 = Color3.fromRGB(240, 240, 240)
+    b.Size = UDim2.new(1, 0, 0, 36)
+    b.BackgroundColor3 = state and THEME.SUCCESS or THEME.PANEL
+    b.Text = (state and "✔   " or "✘   ") .. text
+    b.TextColor3 = THEME.TEXT
     b.Font = Enum.Font.GothamSemibold
     b.TextSize = 13
     b.BorderSizePixel = 0
     b.AutoButtonColor = false
     b.Parent = parent
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
     b.MouseButton1Click:Connect(function()
         state = not state
-        b.BackgroundColor3 = state and Color3.fromRGB(0, 150, 80) or Color3.fromRGB(45, 45, 55)
-        b.Text = (state and "✔  " or "✘  ") .. text
+        TweenService:Create(b, TweenInfo.new(0.2), {
+            BackgroundColor3 = state and THEME.SUCCESS or THEME.PANEL
+        }):Play()
+        b.Text = (state and "✔   " or "✘   ") .. text
         task.spawn(function()
             local ok, err = pcall(callback, state)
             if not ok then warn("[AutoFarm] ERRO: " .. tostring(err)) end
@@ -543,8 +605,10 @@ local function makeToggle(parent, text, initial, callback)
         getState = function() return state end,
         setState = function(v)
             state = v
-            b.BackgroundColor3 = state and Color3.fromRGB(0, 150, 80) or Color3.fromRGB(45, 45, 55)
-            b.Text = (state and "✔  " or "✘  ") .. text
+            TweenService:Create(b, TweenInfo.new(0.2), {
+                BackgroundColor3 = state and THEME.SUCCESS or THEME.PANEL
+            }):Play()
+            b.Text = (state and "✔   " or "✘   ") .. text
         end
     }
 end
@@ -553,10 +617,9 @@ end
 -- ABA 1: AUTO FARM
 -- ============================
 local farmPage = createTab("Auto Farm")
+makeSection(farmPage, "SELEÇÃO DE ALVO")
 
-makeSection(farmPage, "SELEÇÃO")
-
-makeButton(farmPage, "🔍 Escanear Mobs (agrupados por tipo)", function()
+makeButton(farmPage, "🔍  Escanear Mobs (Nome + Rank)", function()
     setStatus("Escaneando...")
     local list, total = scanMobs()
     if total == 0 then setStatus("Nenhum mob encontrado") return end
@@ -566,18 +629,18 @@ end)
 
 local dropdownContainer = Instance.new("Frame")
 dropdownContainer.Size = UDim2.new(1, 0, 0, 0)
-dropdownContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+dropdownContainer.BackgroundColor3 = THEME.PANEL
 dropdownContainer.BorderSizePixel = 0
 dropdownContainer.AutomaticSize = Enum.AutomaticSize.Y
 dropdownContainer.Parent = farmPage
-Instance.new("UICorner", dropdownContainer).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", dropdownContainer).CornerRadius = UDim.new(0, 10)
 
 local dTitle = Instance.new("TextLabel")
-dTitle.Size = UDim2.new(1, -16, 0, 24)
+dTitle.Size = UDim2.new(1, -16, 0, 28)
 dTitle.Position = UDim2.new(0, 8, 0, 4)
 dTitle.BackgroundTransparency = 1
-dTitle.Text = "🎯 Escolha o mob (por prefixo do ID):"
-dTitle.TextColor3 = Color3.fromRGB(200, 200, 210)
+dTitle.Text = "🎯  Escolha o mob:"
+dTitle.TextColor3 = THEME.TEXT_DIM
 dTitle.Font = Enum.Font.GothamSemibold
 dTitle.TextSize = 12
 dTitle.TextXAlignment = Enum.TextXAlignment.Left
@@ -594,11 +657,11 @@ function populateDropdown()
     if #State.MobList == 0 then return end
     for _, data in ipairs(State.MobList) do
         local mobBtn = Instance.new("TextButton")
-        mobBtn.Size = UDim2.new(1, -16, 0, 30)
+        mobBtn.Size = UDim2.new(1, -16, 0, 32)
         mobBtn.BackgroundColor3 = (Config.SelectedMob == data.key)
-            and Color3.fromRGB(0, 120, 200) or Color3.fromRGB(45, 45, 55)
-        mobBtn.Text = "  [" .. data.rank .. "]  " .. data.name .. "   (" .. data.count .. "x)"
-        mobBtn.TextColor3 = RANK_COLORS[data.rank] or Color3.fromRGB(240, 240, 240)
+            and THEME.ACCENT or THEME.BG
+        mobBtn.Text = "  [" .. data.rank .. "]   " .. data.name .. "    (" .. data.count .. "x)"
+        mobBtn.TextColor3 = RANK_COLORS[data.rank] or THEME.TEXT
         mobBtn.Font = Enum.Font.GothamSemibold
         mobBtn.TextSize = 13
         mobBtn.BorderSizePixel = 0
@@ -610,7 +673,7 @@ function populateDropdown()
             Config.SelectedMob = data.key
             State.CurrentTarget = nil
             State.TargetTeleported = false
-            setStatus("Alvo: " .. data.name .. " (" .. data.count .. " mobs)")
+            setStatus("Alvo: [" .. data.rank .. "] " .. data.name)
             populateDropdown()
         end)
     end
@@ -618,7 +681,7 @@ end
 
 makeSection(farmPage, "CONTROLE")
 
-local afToggle = makeToggle(farmPage, "⚔️ Ativar Auto Farm", false, function(state)
+local afToggle = makeToggle(farmPage, "⚔️  Ativar Auto Farm", false, function(state)
     if state and not Config.SelectedMob then
         setStatus("Escolha um mob primeiro")
         afToggle.setState(false)
@@ -637,7 +700,7 @@ local afToggle = makeToggle(farmPage, "⚔️ Ativar Auto Farm", false, function
     end
 end)
 
-makeButton(farmPage, "🛑 Parar Auto Farm", function()
+makeButton(farmPage, "🛑  Parar Auto Farm", function()
     Config.AutoFarm = false
     State.CurrentTarget = nil
     State.TargetTeleported = false
@@ -650,16 +713,16 @@ end)
 -- ============================
 local upPage = createTab("Upgrades")
 makeSection(upPage, "RANK UP")
-makeToggle(upPage, "⬆️ Auto RankUp", false, function(state)
+makeToggle(upPage, "⬆️  Auto RankUp", false, function(state)
     Config.AutoRankUp = state
     setStatus("Auto RankUp: " .. (state and "ON" or "OFF"))
 end)
 makeSection(upPage, "STARS")
-makeToggle(upPage, "⭐ Auto Open Star 1", false, function(state)
+makeToggle(upPage, "⭐  Auto Open Star 1", false, function(state)
     Config.AutoStar1 = state
     setStatus("Star 1: " .. (state and "ON" or "OFF"))
 end)
-makeToggle(upPage, "🌟 Auto Open Star 2", false, function(state)
+makeToggle(upPage, "🌟  Auto Open Star 2", false, function(state)
     Config.AutoStar2 = state
     setStatus("Star 2: " .. (state and "ON" or "OFF"))
 end)
@@ -668,14 +731,42 @@ end)
 -- ABA 3: QUESTS
 -- ============================
 local qPage = createTab("Quests")
-makeSection(qPage, "WORLD 1")
+
+makeSection(qPage, "AÇÕES")
+
+makeToggle(qPage, "📜  Auto Aceitar Quest", false, function(state)
+    Config.AutoAcceptQuest = state
+    setStatus("Auto Aceitar: " .. (state and "ON" or "OFF"))
+end)
+
+makeToggle(qPage, "✅  Auto Completar Quest", false, function(state)
+    Config.AutoCompleteQuest = state
+    if state then
+        -- Liga o Auto Farm automaticamente
+        setStatus("Auto Completar ativo (Auto Farm ligado)")
+    end
+end)
+
+makeToggle(qPage, "🚀  Auto Ir ao Local da Quest", false, function(state)
+    Config.AutoTeleportQuest = state
+    setStatus("Auto Teleporte: " .. (state and "ON" or "OFF"))
+end)
+
+makeSection(qPage, "FILTRO DE MOB DA QUEST")
+makeButton(qPage, "✏️  Definir palavra-chave (F9 mostra)", function()
+    print("[AutoFarm] Digite o nome do mob da quest no chat ou edite Config.QuestMobKeyword")
+    print("[AutoFarm] Palavra atual: '" .. Config.QuestMobKeyword .. "'")
+end)
+
+makeSection(qPage, "QUESTS MANUAIS — WORLD 1")
 for _, q in ipairs({"Stop","Q1","Q2","Q3","Q4","Q5","Q6"}) do
     makeButton(qPage, "  " .. q, function()
         if q == "Stop" then State.CurrentQuest = nil setStatus("Quests paradas")
         else State.CurrentQuest = nil task.wait(0.1) startQuest(q) setStatus("Quest: " .. q) end
     end)
 end
-makeSection(qPage, "WORLD 2")
+
+makeSection(qPage, "QUESTS MANUAIS — WORLD 2")
 for _, q in ipairs({"Stop","Q8","Q9","Q10","Q11","Q12","Q13"}) do
     makeButton(qPage, "  " .. q, function()
         if q == "Stop" then State.CurrentQuest = nil setStatus("Quests paradas")
@@ -684,59 +775,47 @@ for _, q in ipairs({"Stop","Q8","Q9","Q10","Q11","Q12","Q13"}) do
 end
 
 -- ============================
--- ABA 4: INSPEÇÃO
+-- ABA 4: INFO
 -- ============================
-local inspectPage = createTab("Inspeção")
-makeSection(inspectPage, "ESTRUTURA DO MOB")
+local infoPage = createTab("Info")
 
-local inspectBox = Instance.new("TextLabel")
-inspectBox.Size = UDim2.new(1, 0, 0, 0)
-inspectBox.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-inspectBox.BorderSizePixel = 0
-inspectBox.Text = "Clique no botão abaixo."
-inspectBox.TextColor3 = Color3.fromRGB(200, 220, 200)
-inspectBox.Font = Enum.Font.Code
-inspectBox.TextSize = 11
-inspectBox.TextXAlignment = Enum.TextXAlignment.Left
-inspectBox.TextYAlignment = Enum.TextYAlignment.Top
-inspectBox.TextWrapped = true
-inspectBox.AutomaticSize = Enum.AutomaticSize.Y
-inspectBox.Parent = inspectPage
-Instance.new("UICorner", inspectBox).CornerRadius = UDim.new(0, 8)
-local iPad = Instance.new("UIPadding", inspectBox)
-iPad.PaddingTop = UDim.new(0, 8); iPad.PaddingLeft = UDim.new(0, 8)
-iPad.PaddingRight = UDim.new(0, 8); iPad.PaddingBottom = UDim.new(0, 8)
+local infoBox = Instance.new("TextLabel")
+infoBox.Size = UDim2.new(1, 0, 0, 0)
+infoBox.BackgroundColor3 = THEME.PANEL
+infoBox.BorderSizePixel = 0
+infoBox.Text = [[
+⚔️  AUTO FARM PRO v14
 
-makeButton(inspectPage, "🔬 Inspecionar 1º Mob (mostra 3)", function()
-    local folder = getMobFolder()
-    if not folder then
-        inspectBox.Text = "Pasta de mobs não encontrada!"
-        return
-    end
-    local lines = {}
-    table.insert(lines, "Caminho: " .. folder:GetFullName())
-    table.insert(lines, "Filhos: " .. #folder:GetChildren())
-    table.insert(lines, "")
-    local count = 0
-    for _, mob in ipairs(folder:GetChildren()) do
-        if mob:IsA("Model") and count < 3 then
-            count = count + 1
-            table.insert(lines, "=== MOB " .. count .. " ===")
-            local mob = folder:GetChildren()[count]
-            -- pega o primeiro Model que encontrar
-            for _, m in ipairs(folder:GetChildren()) do
-                if m:IsA("Model") and m.Name ~= lastInspected then
-                    mob = m
-                    lastInspected = m.Name
-                    break
-                end
-            end
-            break
-        end
-    end
-    inspectBox.Text = table.concat(lines, "\n")
-    setStatus("Inspeção ✓")
-end)
+▸ Como usar:
+  1. Vá para uma área com mobs
+  2. Clique em "Escanear Mobs"
+  3. Escolha o mob no dropdown
+  4. Ative o Auto Farm
+
+▸ Quests:
+  • Auto Aceitar: aceita a quest seguinte quando a atual completa
+  • Auto Completar: liga o Auto Farm automaticamente
+  • Auto Ir ao Local: teleporta até o mob da quest
+
+▸ Dica:
+  Use a keyword da quest no filtro pra teleportar
+  até o mob certo automaticamente.
+
+▸ Créditos:
+  Feito para Anime Eternal
+]]
+infoBox.TextColor3 = THEME.TEXT
+infoBox.Font = Enum.Font.Gotham
+infoBox.TextSize = 12
+infoBox.TextXAlignment = Enum.TextXAlignment.Left
+infoBox.TextYAlignment = Enum.TextYAlignment.Top
+infoBox.TextWrapped = true
+infoBox.AutomaticSize = Enum.AutomaticSize.Y
+infoBox.Parent = infoPage
+Instance.new("UICorner", infoBox).CornerRadius = UDim.new(0, 10)
+local infoPad = Instance.new("UIPadding", infoBox)
+infoPad.PaddingTop = UDim.new(0, 12); infoPad.PaddingLeft = UDim.new(0, 12)
+infoPad.PaddingRight = UDim.new(0, 12); infoPad.PaddingBottom = UDim.new(0, 12)
 
 -- ============================
 -- FINALIZAÇÃO
@@ -748,5 +827,20 @@ closeBtn.MouseButton1Click:Connect(function()
     screenGui:Destroy()
 end)
 
-print("[AutoFarm v13] Pronto!")
-setStatus("Clique em '🔍 Escanear Mobs'")
+-- Auto refresh a cada 5s se a UI estiver aberta
+task.spawn(function()
+    while screenGui and screenGui.Parent do
+        task.wait(5)
+        if not Config.AutoFarm then
+            pcall(function()
+                local list, total = scanMobs()
+                if total > 0 and #State.MobList > 0 then
+                    populateDropdown()
+                end
+            end)
+        end
+    end
+end)
+
+print("[AutoFarm v14] Pronto!")
+setStatus("Pronto!")
