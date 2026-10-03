@@ -1,20 +1,20 @@
 --[[
-    Auto Farm Pro v12 - Anime Eternal
-    - Detecção de mob em Debris.Monsters
-    - Trava de alvo (só troca quando morre)
-    - Auto RankUp, Auto Stars, Auto Quests
-    - Sistema de abas + inspeção
+    Auto Farm Pro v13 - Anime Eternal
+    - UI arrastável (drag manual, funciona em qualquer executor)
+    - Agrupamento de mobs por PREFIXO do ID
+    - Auto RankUp, Auto Stars, Auto Quests, Inspeção
 --]]
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-print("[AutoFarm v12] Iniciando...")
+print("[AutoFarm v13] Iniciando...")
 
 -- ============================
 -- CONSTANTES
@@ -25,33 +25,21 @@ local RANK_COLORS = {
     C=Color3.fromRGB(100,170,255), B=Color3.fromRGB(180,110,255),
     A=Color3.fromRGB(255,210,60), S=Color3.fromRGB(255,120,50),
     SS=Color3.fromRGB(255,50,150), SSS=Color3.fromRGB(255,0,0),
+    ["?"]=Color3.fromRGB(200,200,200),
 }
 
--- ============================
--- CONFIG
--- ============================
 local Config = {
-    AutoFarm = false,
-    SelectedMob = nil,
-    TeleportDistance = 5,
-    AttackCooldown = 0.2,
-    KillTimeout = 12,
-    HpCheckInterval = 1.5,
-    AutoRankUp = false,
-    AutoStar1 = false,
-    AutoStar2 = false,
+    AutoFarm = false, SelectedMob = nil,
+    TeleportDistance = 5, AttackCooldown = 0.2,
+    KillTimeout = 12, HpCheckInterval = 1.5,
+    AutoRankUp = false, AutoStar1 = false, AutoStar2 = false,
 }
 
 local State = {
-    LastAttack = 0,
-    MobCache = {},
-    MobList = {},
-    AutoFarmThread = nil,
-    CurrentTarget = nil,
-    TargetStartTime = 0,
-    LastHpCheck = 0,
-    TargetTeleported = false,
-    LastTargetHp = 0,
+    LastAttack = 0, MobCache = {}, MobList = {},
+    AutoFarmThread = nil, CurrentTarget = nil,
+    TargetStartTime = 0, LastHpCheck = 0,
+    TargetTeleported = false, LastTargetHp = 0,
     CurrentQuest = nil,
 }
 
@@ -60,9 +48,9 @@ local State = {
 -- ============================
 local function fireToServer(args)
     local events = ReplicatedStorage:FindFirstChild("Events")
-    if not events then warn("[AutoFarm] Events não encontrado"); return false end
+    if not events then return false end
     local ev = events:FindFirstChild("To_Server")
-    if not ev then warn("[AutoFarm] To_Server não encontrado"); return false end
+    if not ev then return false end
     pcall(function() ev:FireServer(unpack(args)) end)
     return true
 end
@@ -84,7 +72,7 @@ local function getMobFolder()
 end
 
 -- ============================
--- UTILS DE MOB
+-- UTILS
 -- ============================
 local function looksLikeId(s)
     if #s < 20 then return false end
@@ -96,25 +84,30 @@ local function looksLikeId(s)
     return (numeric / #s) > 0.4
 end
 
+-- Extrai o "tipo" do mob: se for ID tipo "0a75-2e1c84a1a75df17...", pega o prefixo antes do hífen
+-- Se não, retorna o nome normal
+local function extractType(mob)
+    local name = mob.Name
+    -- Formato: "XXXX-XXXXXXXXXXXXXXXXXXXXXXXX"
+    local prefix = name:match("^(%x+)%-%x+$")
+    if prefix then
+        return prefix:upper()  -- ex: "0A75"
+    end
+    -- Formato com espaço: "0a75 2e1c..."
+    prefix = name:match("^(%x+)%s")
+    if prefix then return prefix:upper() end
+    -- Senão usa o nome limpo
+    return name:gsub("%s*%(%d+%)$", ""):gsub("%s*%([EDCBAS]+%)$", "")
+end
+
 local function extractRank(mob)
     for _, attr in ipairs(mob:GetAttributes()) do
         local val = mob:GetAttribute(attr)
         if type(val) == "string" and RANK_ORDER[val:upper()] then return val:upper() end
-        if attr:lower():find("rank") or attr:lower():find("tier") then
-            if type(val) == "string" then return val:upper() end
-        end
     end
     for _, child in ipairs(mob:GetChildren()) do
-        local cn = child.Name:lower()
-        if (cn:find("rank") or cn:find("tier")) and child:IsA("StringValue") then
-            local v = child.Value:upper()
-            if RANK_ORDER[v] then return v end
-        end
-    end
-    for _, child in ipairs(mob:GetChildren()) do
-        if child:IsA("StringValue") then
-            local v = child.Value:upper()
-            if RANK_ORDER[v] then return v end
+        if child:IsA("StringValue") and RANK_ORDER[child.Value:upper()] then
+            return child.Value:upper()
         end
     end
     local fromName = mob.Name:match("%(([EDCBAS]+)%)") or mob.Name:match("[%s_%-]([EDCBAS]+)$")
@@ -123,22 +116,21 @@ local function extractRank(mob)
 end
 
 local function extractName(mob)
+    -- Se o nome é ID, tenta achar em atributos/filhos
     local hum = mob:FindFirstChildOfClass("Humanoid")
     if hum and hum.DisplayName and hum.DisplayName ~= "" and not looksLikeId(hum.DisplayName) then
-        local clean = hum.DisplayName:gsub("%s*%([EDCBAS]+%)", ""):gsub("[%s_%-][EDCBAS]+$", "")
-        clean = clean:gsub("^%s+", ""):gsub("%s+$", "")
-        if #clean > 0 then return clean end
+        return hum.DisplayName
     end
     for _, child in ipairs(mob:GetChildren()) do
-        if child:IsA("StringValue") and not looksLikeId(child.Value) then
+        if child:IsA("StringValue") and not looksLikeId(child.Value) and #child.Value > 0 and #child.Value < 40 then
             local cn = child.Name:lower()
             if cn == "name" or cn == "mobname" or cn:find("displayname") then
                 return child.Value
             end
         end
     end
-    local n = mob.Name:gsub("%s*%(%d+%)$", ""):gsub("%s*%([EDCBAS]+%)$", ""):gsub("[%s_%-][EDCBAS]+$", "")
-    return n
+    -- Fallback: nome do model
+    return mob.Name
 end
 
 local function isAliveMob(instance)
@@ -164,11 +156,19 @@ local function scanMobs()
     for _, d in ipairs(folder:GetChildren()) do
         if isAliveMob(d) then
             totalFound = totalFound + 1
-            local name = extractName(d)
+            -- 🔑 Agrupa por PREFIXO do ID
+            local mobType = extractType(d)
             local rank = extractRank(d)
-            local key = name .. " [" .. rank .. "]"
+            local key = mobType .. " [" .. rank .. "]"
             if not mobTypes[key] then
-                mobTypes[key] = { name = name, rank = rank, key = key, count = 0, examples = {} }
+                mobTypes[key] = {
+                    name = mobType,
+                    rank = rank,
+                    key = key,
+                    count = 0,
+                    examples = {},
+                    sampleName = d.Name,  -- guarda 1 nome completo como exemplo
+                }
             end
             mobTypes[key].count = mobTypes[key].count + 1
             table.insert(mobTypes[key].examples, d)
@@ -180,11 +180,14 @@ local function scanMobs()
         local ra = RANK_ORDER[a.rank] or 99
         local rb = RANK_ORDER[b.rank] or 99
         if ra ~= rb then return ra < rb end
-        return a.name < b.name
+        return a.count > b.count
     end)
     State.MobCache = mobTypes
     State.MobList = list
     print("[AutoFarm] Scan: " .. totalFound .. " mobs, " .. #list .. " tipos (" .. math.floor((tick()-t0)*100)/100 .. "s)")
+    for _, d in ipairs(list) do
+        print("  - [" .. d.rank .. "] " .. d.name .. " (" .. d.count .. "x)  ex: " .. d.sampleName)
+    end
     return list, totalFound
 end
 
@@ -222,14 +225,11 @@ local function autoFarmLoop()
         local target = State.CurrentTarget
         local needNewTarget = false
 
-        if not target then
-            needNewTarget = true
-        elseif not target.Parent then
-            needNewTarget = true
+        if not target then needNewTarget = true
+        elseif not target.Parent then needNewTarget = true
         else
             local h = target:FindFirstChildOfClass("Humanoid")
-            if not h or h.Health <= 0 then
-                needNewTarget = true
+            if not h or h.Health <= 0 then needNewTarget = true
             else
                 local now = tick()
                 if now - State.LastHpCheck >= Config.HpCheckInterval then
@@ -289,7 +289,7 @@ local function autoFarmLoop()
 end
 
 -- ============================
--- FUNÇÕES EXTRAS (loops)
+-- LOOPS EXTRAS
 -- ============================
 task.spawn(function()
     while true do
@@ -299,7 +299,6 @@ task.spawn(function()
         end
     end
 end)
-
 task.spawn(function()
     while true do
         task.wait(1)
@@ -308,7 +307,6 @@ task.spawn(function()
         end
     end
 end)
-
 task.spawn(function()
     while true do
         task.wait(1)
@@ -335,33 +333,56 @@ end
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "AutoFarmPro"
 screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = PlayerGui
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(0, 580, 0, 660)
-mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
-mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+mainFrame.Position = UDim2.new(0.5, -290, 0.5, -330)
 mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
 mainFrame.BorderSizePixel = 0
-mainFrame.Active = false
-mainFrame.Draggable = false
+mainFrame.Active = false       -- ⚠️ false para não roubar input
+mainFrame.Draggable = false    -- ⚠️ drag manual
 mainFrame.Parent = screenGui
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
+Instance.new("UIStroke", mainFrame).Color = Color3.fromRGB(60, 120, 220)
+
+-- ⚠️ SISTEMA DE DRAG MANUAL (funciona em qualquer executor)
+local dragging, dragStart, startPos
+local function makeDragHandle(handle)
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = mainFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
 
 local topBar = Instance.new("Frame")
 topBar.Size = UDim2.new(1, 0, 0, 45)
 topBar.BackgroundColor3 = Color3.fromRGB(40, 90, 180)
 topBar.BorderSizePixel = 0
-topBar.Active = true
-topBar.Draggable = true
 topBar.Parent = mainFrame
 Instance.new("UICorner", topBar).CornerRadius = UDim.new(0, 12)
+makeDragHandle(topBar)  -- ⚠️ registra drag no topBar
 
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -70, 1, 0)
 title.Position = UDim2.new(0, 15, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "⚔️ AUTO FARM PRO v12 - Anime Eternal"
+title.Text = "⚔️ AUTO FARM PRO v13 - Anime Eternal"
 title.TextColor3 = Color3.fromRGB(255,255,255)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 14
@@ -394,8 +415,7 @@ tabLayout.FillDirection = Enum.FillDirection.Horizontal
 tabLayout.Padding = UDim.new(0, 4)
 tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
 tabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-local tabPad = Instance.new("UIPadding", tabBar)
-tabPad.PaddingLeft = UDim.new(0, 4)
+Instance.new("UIPadding", tabBar).PaddingLeft = UDim.new(0, 4)
 
 local content = Instance.new("ScrollingFrame")
 content.Size = UDim2.new(1, -20, 1, -140)
@@ -423,7 +443,6 @@ local function setStatus(txt)
     statusLabel.Text = "Status: " .. txt
 end
 
--- Sistema de abas
 local pages = {}
 local tabButtons = {}
 
@@ -537,7 +556,7 @@ local farmPage = createTab("Auto Farm")
 
 makeSection(farmPage, "SELEÇÃO")
 
-makeButton(farmPage, "🔍 Escanear Mobs", function()
+makeButton(farmPage, "🔍 Escanear Mobs (agrupados por tipo)", function()
     setStatus("Escaneando...")
     local list, total = scanMobs()
     if total == 0 then setStatus("Nenhum mob encontrado") return end
@@ -557,7 +576,7 @@ local dTitle = Instance.new("TextLabel")
 dTitle.Size = UDim2.new(1, -16, 0, 24)
 dTitle.Position = UDim2.new(0, 8, 0, 4)
 dTitle.BackgroundTransparency = 1
-dTitle.Text = "🎯 Escolha o mob:"
+dTitle.Text = "🎯 Escolha o mob (por prefixo do ID):"
 dTitle.TextColor3 = Color3.fromRGB(200, 200, 210)
 dTitle.Font = Enum.Font.GothamSemibold
 dTitle.TextSize = 12
@@ -591,7 +610,7 @@ function populateDropdown()
             Config.SelectedMob = data.key
             State.CurrentTarget = nil
             State.TargetTeleported = false
-            setStatus("Alvo: [" .. data.rank .. "] " .. data.name)
+            setStatus("Alvo: " .. data.name .. " (" .. data.count .. " mobs)")
             populateDropdown()
         end)
     end
@@ -630,13 +649,11 @@ end)
 -- ABA 2: UPGRADES
 -- ============================
 local upPage = createTab("Upgrades")
-
 makeSection(upPage, "RANK UP")
 makeToggle(upPage, "⬆️ Auto RankUp", false, function(state)
     Config.AutoRankUp = state
     setStatus("Auto RankUp: " .. (state and "ON" or "OFF"))
 end)
-
 makeSection(upPage, "STARS")
 makeToggle(upPage, "⭐ Auto Open Star 1", false, function(state)
     Config.AutoStar1 = state
@@ -651,39 +668,18 @@ end)
 -- ABA 3: QUESTS
 -- ============================
 local qPage = createTab("Quests")
-
 makeSection(qPage, "WORLD 1")
-
-local w1Options = {"Stop","Q1","Q2","Q3","Q4","Q5","Q6"}
-local w1Btns = {}
-for _, q in ipairs(w1Options) do
+for _, q in ipairs({"Stop","Q1","Q2","Q3","Q4","Q5","Q6"}) do
     makeButton(qPage, "  " .. q, function()
-        if q == "Stop" then
-            State.CurrentQuest = nil
-            setStatus("Quests paradas")
-        else
-            State.CurrentQuest = nil
-            task.wait(0.1)
-            startQuest(q)
-            setStatus("Quest: " .. q)
-        end
+        if q == "Stop" then State.CurrentQuest = nil setStatus("Quests paradas")
+        else State.CurrentQuest = nil task.wait(0.1) startQuest(q) setStatus("Quest: " .. q) end
     end)
 end
-
 makeSection(qPage, "WORLD 2")
-
-local w2Options = {"Stop","Q8","Q9","Q10","Q11","Q12","Q13"}
-for _, q in ipairs(w2Options) do
+for _, q in ipairs({"Stop","Q8","Q9","Q10","Q11","Q12","Q13"}) do
     makeButton(qPage, "  " .. q, function()
-        if q == "Stop" then
-            State.CurrentQuest = nil
-            setStatus("Quests paradas")
-        else
-            State.CurrentQuest = nil
-            task.wait(0.1)
-            startQuest(q)
-            setStatus("Quest: " .. q)
-        end
+        if q == "Stop" then State.CurrentQuest = nil setStatus("Quests paradas")
+        else State.CurrentQuest = nil task.wait(0.1) startQuest(q) setStatus("Quest: " .. q) end
     end)
 end
 
@@ -691,14 +687,13 @@ end
 -- ABA 4: INSPEÇÃO
 -- ============================
 local inspectPage = createTab("Inspeção")
-
 makeSection(inspectPage, "ESTRUTURA DO MOB")
 
 local inspectBox = Instance.new("TextLabel")
 inspectBox.Size = UDim2.new(1, 0, 0, 0)
 inspectBox.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
 inspectBox.BorderSizePixel = 0
-inspectBox.Text = "Clique no botão abaixo pra inspecionar."
+inspectBox.Text = "Clique no botão abaixo."
 inspectBox.TextColor3 = Color3.fromRGB(200, 220, 200)
 inspectBox.Font = Enum.Font.Code
 inspectBox.TextSize = 11
@@ -709,70 +704,22 @@ inspectBox.AutomaticSize = Enum.AutomaticSize.Y
 inspectBox.Parent = inspectPage
 Instance.new("UICorner", inspectBox).CornerRadius = UDim.new(0, 8)
 local iPad = Instance.new("UIPadding", inspectBox)
-iPad.PaddingTop = UDim.new(0, 8)
-iPad.PaddingLeft = UDim.new(0, 8)
-iPad.PaddingRight = UDim.new(0, 8)
-iPad.PaddingBottom = UDim.new(0, 8)
+iPad.PaddingTop = UDim.new(0, 8); iPad.PaddingLeft = UDim.new(0, 8)
+iPad.PaddingRight = UDim.new(0, 8); iPad.PaddingBottom = UDim.new(0, 8)
 
-makeButton(inspectPage, "🔬 Inspecionar 1º Mob", function()
+makeButton(inspectPage, "🔬 Inspecionar 1º Mob (mostra 3)", function()
     local folder = getMobFolder()
     if not folder then
-        inspectBox.Text = "Pasta de mobs não encontrada!\nProcurei em: Workspace.Debris.Monsters"
+        inspectBox.Text = "Pasta de mobs não encontrada!"
         return
     end
     local lines = {}
-    table.insert(lines, "== PASTA ==")
     table.insert(lines, "Caminho: " .. folder:GetFullName())
     table.insert(lines, "Filhos: " .. #folder:GetChildren())
     table.insert(lines, "")
+    local count = 0
     for _, mob in ipairs(folder:GetChildren()) do
-        if mob:IsA("Model") then
-            table.insert(lines, "== MOB ==")
-            table.insert(lines, "Model.Name: " .. mob.Name)
-            table.insert(lines, "extractName() = " .. extractName(mob))
-            table.insert(lines, "extractRank() = " .. extractRank(mob))
-            table.insert(lines, "")
-            table.insert(lines, "--- Atributos ---")
-            local attrs = mob:GetAttributes()
-            if #attrs == 0 then table.insert(lines, "(nenhum)")
-            else
-                for _, a in ipairs(attrs) do
-                    table.insert(lines, a .. " = " .. tostring(mob:GetAttribute(a)))
-                end
-            end
-            table.insert(lines, "")
-            table.insert(lines, "--- Filhos ---")
-            for _, c in ipairs(mob:GetChildren()) do
-                local v = ""
-                if c:IsA("StringValue") then v = " = \"" .. c.Value .. "\""
-                elseif c:IsA("NumberValue") or c:IsA("IntValue") then v = " = " .. c.Value
-                elseif c:IsA("BoolValue") then v = " = " .. tostring(c.Value)
-                end
-                table.insert(lines, "[" .. c.ClassName .. "] " .. c.Name .. v)
-            end
-            table.insert(lines, "")
-            local h = mob:FindFirstChildOfClass("Humanoid")
-            if h then
-                table.insert(lines, "--- Humanoid ---")
-                table.insert(lines, "DisplayName: " .. h.DisplayName)
-                table.insert(lines, "Health: " .. h.Health .. "/" .. h.MaxHealth)
-            end
-            break
-        end
-    end
-    inspectBox.Text = table.concat(lines, "\n")
-    setStatus("Inspeção ✓")
-end)
-
--- ============================
--- FINALIZAÇÃO
--- ============================
-switchTab("Auto Farm")
-
-closeBtn.MouseButton1Click:Connect(function()
-    Config.AutoFarm = false
-    screenGui:Destroy()
-end)
-
-print("[AutoFarm v12] Pronto!")
-setStatus("Clique em '🔍 Escanear Mobs'")
+        if mob:IsA("Model") and count < 3 then
+            count = count + 1
+            table.insert(lines, "=== MOB " .. count .. " ===")
+            table.insert(lines, "Name: " ..
