@@ -1,19 +1,28 @@
 --[[
-    Auto Farm Pro v9 - Anime Eternal
-    Fix: teleporte apenas 1x por mob, só troca após matar
-    - Verifica se HP está caindo
-    - Timeout se não conseguir matar
+    Auto Farm Pro v11 - Anime Eternal
+    Integração completa: Yowai Hub + Auto Farm próprio
+    
+    Funções:
+    - Auto Farm com seleção de mob (nome + rank)
+    - Auto RankUp
+    - Auto Quests (World 1 e World 2)
+    - Auto Open Stars (1 e 2)
+    - Trava de alvo (só troca quando o mob morre)
 --]]
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-print("[AutoFarm v9] Iniciando...")
+print("[AutoFarm v11] Iniciando...")
 
+-- ============================
+-- CONSTANTES
+-- ============================
 local RANK_ORDER = { ["E"]=1, ["D"]=2, ["C"]=3, ["B"]=4, ["A"]=5, ["S"]=6, ["SS"]=7, ["SSS"]=8 }
 local RANK_COLORS = {
     E=Color3.fromRGB(180,180,180), D=Color3.fromRGB(120,220,120),
@@ -22,13 +31,22 @@ local RANK_COLORS = {
     SS=Color3.fromRGB(255,50,150), SSS=Color3.fromRGB(255,0,0),
 }
 
+-- ============================
+-- CONFIG
+-- ============================
 local Config = {
     AutoFarm = false,
     SelectedMob = nil,
     TeleportDistance = 5,
     AttackCooldown = 0.2,
-    KillTimeout = 10,       -- segundos tentando matar o mesmo mob
-    HpCheckInterval = 1.5,  -- verifica HP a cada X segundos
+    KillTimeout = 12,
+    HpCheckInterval = 1.5,
+    -- Funções extras
+    AutoRankUp = false,
+    AutoStar1 = false,
+    AutoStar2 = false,
+    AutoQuestWorld1 = "None",  -- "Q1"..."Q6", "None"
+    AutoQuestWorld2 = "None",  -- "Q8"..."Q13", "None"
 }
 
 local State = {
@@ -38,14 +56,52 @@ local State = {
     AutoFarmThread = nil,
     CurrentTarget = nil,
     TargetStartTime = 0,
-    TargetStartHp = 0,
     LastHpCheck = 0,
-    TargetTeleported = false,  -- ← marca se já teleportou pro alvo atual
-    LastTargetHp = 0,          -- ← último HP conhecido, pra saber se está caindo
+    TargetTeleported = false,
+    LastTargetHp = 0,
+    CurrentQuest = nil,
 }
 
 -- ============================
--- UTILS
+-- REMOTE EVENT HELPER
+-- ============================
+local function getToServerEvent()
+    local events = ReplicatedStorage:FindFirstChild("Events")
+    if events then
+        return events:FindFirstChild("To_Server")
+    end
+    return nil
+end
+
+local function fireToServer(args)
+    local ev = getToServerEvent()
+    if not ev then
+        warn("[AutoFarm] RemoteEvent 'To_Server' não encontrado!")
+        return false
+    end
+    pcall(function()
+        ev:FireServer(unpack(args))
+    end)
+    return true
+end
+
+-- ============================
+-- PASTA DE MOBS
+-- ============================
+local function getMobFolder()
+    local debris = Workspace:FindFirstChild("Debris")
+    if not debris then
+        for _, name in ipairs({"Monsters", "Mobs", "Enemies"}) do
+            local f = Workspace:FindFirstChild(name)
+            if f then return f end
+        end
+        return nil
+    end
+    return debris:FindFirstChild("Monsters") or debris:FindFirstChild("MonsterFolder")
+end
+
+-- ============================
+-- UTILS DE MOB
 -- ============================
 local function looksLikeId(s)
     if #s < 20 then return false end
@@ -78,7 +134,7 @@ local function extractRank(mob)
             if RANK_ORDER[v] then return v end
         end
     end
-    local fromName = mob.Name:match("%(([EDCBAS]+)%)") or mob.Name:match("[%s_%-]([EDCBAS]+)$")
+    local fromName = mob.Name:match("%(([EDCBAS]+)%)") or mob.Name:match("[%s_%-]([EDCBAS]+)$") or mob.Name:match("([EDCBAS]+)[%s_%-]")
     if fromName and RANK_ORDER[fromName:upper()] then return fromName:upper() end
     local hum = mob:FindFirstChildOfClass("Humanoid")
     if hum and hum.DisplayName then
@@ -103,13 +159,7 @@ local function extractName(mob)
             end
         end
     end
-    for _, child in ipairs(mob:GetChildren()) do
-        if child:IsA("StringValue") and not looksLikeId(child.Value) and #child.Value < 40 and #child.Value > 2 then
-            return child.Value
-        end
-    end
     local n = mob.Name:gsub("%s*%(%d+%)$", ""):gsub("%s*%([EDCBAS]+%)$", ""):gsub("[%s_%-][EDCBAS]+$", "")
-    if looksLikeId(n) then return "Mob-" .. n:sub(1, 6) end
     return n
 end
 
@@ -124,13 +174,16 @@ local function isAliveMob(instance)
 end
 
 local function scanMobs()
+    print("[AutoFarm] Escaneando pasta de mobs...")
     local t0 = tick()
+    local folder = getMobFolder()
+    if not folder then
+        print("[AutoFarm] ERRO: pasta de mobs não encontrada")
+        return {}, 0
+    end
     local mobTypes = {}
     local totalFound = 0
-    local count = 0
-    for _, d in ipairs(Workspace:GetDescendants()) do
-        count = count + 1
-        if count % 500 == 0 then task.wait() end
+    for _, d in ipairs(folder:GetChildren()) do
         if isAliveMob(d) then
             totalFound = totalFound + 1
             local name = extractName(d)
@@ -153,10 +206,7 @@ local function scanMobs()
     end)
     State.MobCache = mobTypes
     State.MobList = list
-    print("[AutoFarm] Scan: " .. totalFound .. " mobs, " .. #list .. " tipos (" .. math.floor((tick()-t0)*100)/100 .. "s)")
-    for _, d in ipairs(list) do
-        print("  - [" .. d.rank .. "] " .. d.name .. " (" .. d.count .. "x)")
-    end
+    print("[AutoFarm] Scan OK: " .. totalFound .. " mobs, " .. #list .. " tipos (" .. math.floor((tick()-t0)*100)/100 .. "s)")
     return list, totalFound
 end
 
@@ -179,7 +229,7 @@ local function attackMob(mob, humanoid)
 end
 
 -- ============================
--- AUTO FARM LOOP (v9 - trava real de alvo)
+-- AUTO FARM LOOP
 -- ============================
 local function autoFarmLoop()
     print("[AutoFarm] Loop iniciado: " .. tostring(Config.SelectedMob))
@@ -192,49 +242,34 @@ local function autoFarmLoop()
         local mobData = State.MobCache[Config.SelectedMob]
         if not mobData then task.wait(0.5) continue end
 
-        -- ============================================
-        -- VERIFICAR SE O ALVO ATUAL AINDA É VÁLIDO
-        -- ============================================
         local target = State.CurrentTarget
         local needNewTarget = false
 
         if not target then
             needNewTarget = true
         elseif not target.Parent then
-            print("[AutoFarm] Alvo desapareceu")
             needNewTarget = true
         else
             local h = target:FindFirstChildOfClass("Humanoid")
-            if not h then
-                print("[AutoFarm] Alvo sem Humanoid")
-                needNewTarget = true
-            elseif h.Health <= 0 then
-                print("[AutoFarm] Alvo MORTO! HP = " .. h.Health)
+            if not h or h.Health <= 0 then
+                print("[AutoFarm] Alvo MORTO!")
                 needNewTarget = true
             else
-                -- Verifica se HP está caindo (a cada X segundos)
                 local now = tick()
                 if now - State.LastHpCheck >= Config.HpCheckInterval then
                     State.LastHpCheck = now
                     if h.Health >= State.LastTargetHp and State.LastTargetHp > 0 then
-                        -- HP não caiu desde a última verificação
-                        print("[AutoFarm] HP não está caindo (" .. h.Health .. " = " .. State.LastTargetHp .. "). Skipping...")
+                        print("[AutoFarm] HP não cai. Skipping...")
                         needNewTarget = true
                     end
                     State.LastTargetHp = h.Health
                 end
-
-                -- Timeout total
                 if now - State.TargetStartTime > Config.KillTimeout then
-                    print("[AutoFarm] Timeout de " .. Config.KillTimeout .. "s. Skipping...")
                     needNewTarget = true
                 end
             end
         end
 
-        -- ============================================
-        -- ESCOLHER NOVO ALVO (se necessário)
-        -- ============================================
         if needNewTarget then
             State.CurrentTarget = nil
             State.TargetTeleported = false
@@ -254,24 +289,15 @@ local function autoFarmLoop()
                 State.LastHpCheck = tick()
                 State.LastTargetHp = 0
                 target = closestMob
-                local h = closestMob:FindFirstChildOfClass("Humanoid")
-                print("[AutoFarm] NOVO alvo (HP=" .. (h and h.Health or "?") .. ")")
             else
                 task.wait(0.5)
                 continue
             end
         end
 
-        -- ============================================
-        -- TELEPORTE: só 1x por alvo, ou se o mob se moveu muito
-        -- ============================================
         if target and target.Parent and target.PrimaryPart then
             local mobPos = target.PrimaryPart.Position
             local distToMob = (myRoot.Position - mobPos).Magnitude
-
-            -- Teleporta SE:
-            --   - ainda não teleportou pra esse alvo, OU
-            --   - o mob se afastou muito (> 15 studs)
             if not State.TargetTeleported or distToMob > 15 then
                 local dir = (myRoot.Position - mobPos).Unit
                 local targetPos = mobPos + dir * Config.TeleportDistance
@@ -279,16 +305,75 @@ local function autoFarmLoop()
                 myRoot.CFrame = CFrame.new(targetPos)
                 State.TargetTeleported = true
             end
-
-            -- Ataca continuamente
             attackMob(target, target:FindFirstChildOfClass("Humanoid"))
         end
-
         task.wait(0.1)
     end
     State.CurrentTarget = nil
     State.TargetTeleported = false
     print("[AutoFarm] Loop encerrado")
+end
+
+-- ============================
+-- FUNÇÕES EXTRAS (Yowai Hub)
+-- ============================
+
+-- AUTO RANK UP
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if Config.AutoRankUp then
+            fireToServer({{
+                ["Upgrading_Name"] = "Rank",
+                ["Action"] = "_Upgrades",
+                ["Upgrade_Name"] = "Rank_Up"
+            }})
+        end
+    end
+end)
+
+-- AUTO STAR 1
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if Config.AutoStar1 then
+            fireToServer({{
+                ["Open_Amount"] = 5,
+                ["Action"] = "_Stars",
+                ["Name"] = "Star_1"
+            }})
+        end
+    end
+end)
+
+-- AUTO STAR 2
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if Config.AutoStar2 then
+            fireToServer({{
+                ["Open_Amount"] = 5,
+                ["Action"] = "_Stars",
+                ["Name"] = "Star_2"
+            }})
+        end
+    end
+end)
+
+-- AUTO QUEST (genérica)
+local function startQuest(questId)
+    State.CurrentQuest = questId
+    print("[AutoFarm] Iniciando quest: " .. questId)
+    task.spawn(function()
+        while State.CurrentQuest == questId do
+            fireToServer({{
+                ["Id"] = questId:gsub("Q",""),
+                ["Type"] = "Accept",
+                ["Action"] = "_Quest"
+            }})
+            task.wait(1)
+        end
+    end)
 end
 
 -- ============================
@@ -300,7 +385,7 @@ screenGui.ResetOnSpawn = false
 screenGui.Parent = PlayerGui
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 560, 0, 640)
+mainFrame.Size = UDim2.new(0, 580, 0, 660)
 mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
 mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
 mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
@@ -323,10 +408,10 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -70, 1, 0)
 title.Position = UDim2.new(0, 15, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "⚔️ AUTO FARM PRO v9"
+title.Text = "⚔️ AUTO FARM PRO v11 - Anime Eternal"
 title.TextColor3 = Color3.fromRGB(255,255,255)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 15
+title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = topBar
 
@@ -343,9 +428,26 @@ closeBtn.AutoButtonColor = false
 closeBtn.Parent = topBar
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
 
+-- Sistema de ABAS
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -20, 0, 34)
+tabBar.Position = UDim2.new(0, 10, 0, 50)
+tabBar.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+tabBar.BorderSizePixel = 0
+tabBar.Parent = mainFrame
+Instance.new("UICorner", tabBar).CornerRadius = UDim.new(0, 8)
+
+local tabLayout = Instance.new("UIListLayout", tabBar)
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 4)
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+local tabPad = Instance.new("UIPadding", tabBar)
+tabPad.PaddingLeft = UDim.new(0, 4)
+
 local content = Instance.new("ScrollingFrame")
-content.Size = UDim2.new(1, -20, 1, -100)
-content.Position = UDim2.new(0, 10, 0, 50)
+content.Size = UDim2.new(1, -20, 1, -140)
+content.Position = UDim2.new(0, 10, 0, 90)
 content.BackgroundTransparency = 1
 content.BorderSizePixel = 0
 content.ScrollBarThickness = 4
@@ -373,7 +475,54 @@ local function setStatus(txt)
     statusLabel.Text = "Status: " .. txt
 end
 
-local function makeSection(text)
+-- Sistema de abas
+local pages = {}
+local currentPage = nil
+local tabButtons = {}
+
+local function switchTab(tabName)
+    for name, frame in pairs(pages) do
+        frame.Visible = (name == tabName)
+    end
+    for name, btn in pairs(tabButtons) do
+        btn.BackgroundColor3 = (name == tabName)
+            and Color3.fromRGB(40, 90, 180)
+            or Color3.fromRGB(45, 45, 55)
+    end
+    currentPage = pages[tabName]
+end
+
+local function createTab(tabName)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 130, 0, 26)
+    btn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    btn.Text = tabName
+    btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 12
+    btn.BorderSizePixel = 0
+    btn.AutoButtonColor = false
+    btn.Parent = tabBar
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    btn.MouseButton1Click:Connect(function() switchTab(tabName) end)
+
+    local page = Instance.new("Frame")
+    page.Size = UDim2.new(1, 0, 0, 0)
+    page.BackgroundTransparency = 1
+    page.AutomaticSize = Enum.AutomaticSize.Y
+    page.Parent = content
+    local pageLayout = Instance.new("UIListLayout", page)
+    pageLayout.Padding = UDim.new(0, 6)
+    pageLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    page.Visible = false
+
+    pages[tabName] = page
+    tabButtons[tabName] = btn
+    return page
+end
+
+-- Helpers (agora recebem parent)
+local function makeSection(parent, text)
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(1, 0, 0, 24)
     lbl.BackgroundTransparency = 1
@@ -382,11 +531,11 @@ local function makeSection(text)
     lbl.Font = Enum.Font.GothamBold
     lbl.TextSize = 12
     lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.Parent = content
+    lbl.Parent = parent
     return lbl
 end
 
-local function makeButton(text, callback)
+local function makeButton(parent, text, callback)
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1, 0, 0, 34)
     btn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
@@ -396,7 +545,7 @@ local function makeButton(text, callback)
     btn.TextSize = 13
     btn.BorderSizePixel = 0
     btn.AutoButtonColor = false
-    btn.Parent = content
+    btn.Parent = parent
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
     btn.MouseButton1Click:Connect(function()
         print("[AutoFarm] Clicou: " .. text)
@@ -408,7 +557,7 @@ local function makeButton(text, callback)
     return btn
 end
 
-local function makeToggle(text, initial, callback)
+local function makeToggle(parent, text, initial, callback)
     local state = initial
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1, 0, 0, 34)
@@ -419,7 +568,7 @@ local function makeToggle(text, initial, callback)
     btn.TextSize = 13
     btn.BorderSizePixel = 0
     btn.AutoButtonColor = false
-    btn.Parent = content
+    btn.Parent = parent
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
     btn.MouseButton1Click:Connect(function()
         state = not state
@@ -431,15 +580,84 @@ local function makeToggle(text, initial, callback)
             if not ok then warn("[AutoFarm] ERRO: " .. tostring(err)) end
         end)
     end)
-    return { button = btn, getState = function() return state end, setState = function(v) state = v end }
+    return { button = btn, getState = function() return state end, setState = function(v)
+        state = v
+        btn.BackgroundColor3 = state and Color3.fromRGB(0, 150, 80) or Color3.fromRGB(45, 45, 55)
+        btn.Text = (state and "✔  " or "✘  ") .. text
+    end }
+end
+
+local function makeDropdown(parent, text, options, callback)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 0)
+    container.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+    container.BorderSizePixel = 0
+    container.AutomaticSize = Enum.AutomaticSize.Y
+    container.Parent = parent
+    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 8)
+    local containerLayout = Instance.new("UIListLayout", container)
+    containerLayout.Padding = UDim.new(0, 2)
+    containerLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -16, 0, 24)
+    title.Position = UDim2.new(0, 8, 0, 4)
+    title.BackgroundTransparency = 1
+    title.Text = "▾ " .. text
+    title.TextColor3 = Color3.fromRGB(200, 200, 210)
+    title.Font = Enum.Font.GothamSemibold
+    title.TextSize = 12
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = container
+
+    local expanded = false
+    local optionButtons = {}
+
+    local function renderOptions()
+        for _, b in ipairs(optionButtons) do b:Destroy() end
+        optionButtons = {}
+        if expanded then
+            for _, opt in ipairs(options) do
+                local optBtn = Instance.new("TextButton")
+                optBtn.Size = UDim2.new(1, -16, 0, 28)
+                optBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+                optBtn.Text = "  " .. opt
+                optBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+                optBtn.Font = Enum.Font.Gotham
+                optBtn.TextSize = 12
+                optBtn.BorderSizePixel = 0
+                optBtn.AutoButtonColor = false
+                optBtn.TextXAlignment = Enum.TextXAlignment.Left
+                optBtn.Parent = container
+                Instance.new("UICorner", optBtn).CornerRadius = UDim.new(0, 6)
+                optBtn.MouseButton1Click:Connect(function()
+                    title.Text = "▾ " .. text .. " [" .. opt .. "]"
+                    task.spawn(function() pcall(callback, opt) end)
+                end)
+                table.insert(optionButtons, optBtn)
+            end
+        end
+    end
+
+    local header = Instance.new("TextButton")
+    header.Size = UDim2.new(1, -16, 0, 24)
+    header.BackgroundTransparency = 1
+    header.Text = ""
+    header.Parent = container
+    header.MouseButton1Click:Connect(function()
+        expanded = not expanded
+        renderOptions()
+    end)
 end
 
 -- ============================
--- AUTO FARM
+-- ABA 1: AUTO FARM
 -- ============================
-makeSection("AUTO FARM")
+local farmPage = createTab("Auto Farm")
 
-makeButton("🔍 Escanear Mobs", function()
+makeSection(farmPage, "SELEÇÃO DE MOB")
+
+makeButton(farmPage, "🔍 Escanear Mobs (Debris.Monsters)", function()
     setStatus("Escaneando...")
     local list, total = scanMobs()
     if total == 0 then setStatus("Nenhum mob encontrado") return end
@@ -447,24 +665,25 @@ makeButton("🔍 Escanear Mobs", function()
     populateDropdown()
 end)
 
+-- Dropdown container
 local dropdownContainer = Instance.new("Frame")
 dropdownContainer.Size = UDim2.new(1, 0, 0, 0)
 dropdownContainer.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
 dropdownContainer.BorderSizePixel = 0
 dropdownContainer.AutomaticSize = Enum.AutomaticSize.Y
-dropdownContainer.Parent = content
+dropdownContainer.Parent = farmPage
 Instance.new("UICorner", dropdownContainer).CornerRadius = UDim.new(0, 8)
 
-local dropdownLabel = Instance.new("TextLabel")
-dropdownLabel.Size = UDim2.new(1, -16, 0, 24)
-dropdownLabel.Position = UDim2.new(0, 8, 0, 4)
-dropdownLabel.BackgroundTransparency = 1
-dropdownLabel.Text = "🎯 Escolha o mob:"
-dropdownLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
-dropdownLabel.Font = Enum.Font.GothamSemibold
-dropdownLabel.TextSize = 12
-dropdownLabel.TextXAlignment = Enum.TextXAlignment.Left
-dropdownLabel.Parent = dropdownContainer
+local dropdownTitle = Instance.new("TextLabel")
+dropdownTitle.Size = UDim2.new(1, -16, 0, 24)
+dropdownTitle.Position = UDim2.new(0, 8, 0, 4)
+dropdownTitle.BackgroundTransparency = 1
+dropdownTitle.Text = "🎯 Escolha o mob:"
+dropdownTitle.TextColor3 = Color3.fromRGB(200, 200, 210)
+dropdownTitle.Font = Enum.Font.GothamSemibold
+dropdownTitle.TextSize = 12
+dropdownTitle.TextXAlignment = Enum.TextXAlignment.Left
+dropdownTitle.Parent = dropdownContainer
 
 local dropdownLayout = Instance.new("UIListLayout", dropdownContainer)
 dropdownLayout.Padding = UDim.new(0, 2)
@@ -494,19 +713,18 @@ function populateDropdown()
             Config.SelectedMob = data.key
             State.CurrentTarget = nil
             State.TargetTeleported = false
-            print("[AutoFarm] Alvo: " .. data.key)
             setStatus("Alvo: [" .. data.rank .. "] " .. data.name)
             populateDropdown()
         end)
     end
 end
 
-local autoFarmToggle = makeToggle("⚔️ Ativar Auto Farm", false, function(state)
+makeSection(farmPage, "CONTROLE")
+
+local autoFarmToggle = makeToggle(farmPage, "⚔️ Ativar Auto Farm", false, function(state)
     if state and not Config.SelectedMob then
         setStatus("Escolha um mob primeiro")
         autoFarmToggle.setState(false)
-        autoFarmToggle.button.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-        autoFarmToggle.button.Text = "✘  ⚔️ Ativar Auto Farm"
         return
     end
     Config.AutoFarm = state
@@ -522,89 +740,42 @@ local autoFarmToggle = makeToggle("⚔️ Ativar Auto Farm", false, function(sta
     end
 end)
 
-makeSection("INSPEÇÃO")
-
-local inspectBox = Instance.new("TextLabel")
-inspectBox.Size = UDim2.new(1, 0, 0, 0)
-inspectBox.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-inspectBox.BorderSizePixel = 0
-inspectBox.Text = ""
-inspectBox.TextColor3 = Color3.fromRGB(200, 220, 200)
-inspectBox.Font = Enum.Font.Code
-inspectBox.TextSize = 11
-inspectBox.TextXAlignment = Enum.TextXAlignment.Left
-inspectBox.TextYAlignment = Enum.TextYAlignment.Top
-inspectBox.TextWrapped = true
-inspectBox.AutomaticSize = Enum.AutomaticSize.Y
-inspectBox.Parent = content
-Instance.new("UICorner", inspectBox).CornerRadius = UDim.new(0, 8)
-local inspectPad = Instance.new("UIPadding", inspectBox)
-inspectPad.PaddingTop = UDim.new(0, 8)
-inspectPad.PaddingLeft = UDim.new(0, 8)
-inspectPad.PaddingRight = UDim.new(0, 8)
-inspectPad.PaddingBottom = UDim.new(0, 8)
-
-local function inspectFirstMob()
-    for _, d in ipairs(Workspace:GetDescendants()) do
-        if isAliveMob(d) then
-            local lines = {}
-            table.insert(lines, "== ESTRUTURA ==")
-            table.insert(lines, "Model.Name: " .. d.Name)
-            table.insert(lines, "")
-            table.insert(lines, "--- Atributos ---")
-            local attrs = d:GetAttributes()
-            if #attrs == 0 then table.insert(lines, "(nenhum)")
-            else
-                for _, attr in ipairs(attrs) do
-                    table.insert(lines, attr .. " = " .. tostring(d:GetAttribute(attr)))
-                end
-            end
-            table.insert(lines, "")
-            table.insert(lines, "--- Filhos ---")
-            for _, c in ipairs(d:GetChildren()) do
-                local val = ""
-                if c:IsA("StringValue") then val = " = \"" .. c.Value .. "\""
-                elseif c:IsA("NumberValue") or c:IsA("IntValue") then val = " = " .. c.Value
-                elseif c:IsA("BoolValue") then val = " = " .. tostring(c.Value)
-                end
-                table.insert(lines, "[" .. c.ClassName .. "] " .. c.Name .. val)
-            end
-            table.insert(lines, "")
-            table.insert(lines, "--- Humanoid ---")
-            local hum = d:FindFirstChildOfClass("Humanoid")
-            if hum then
-                table.insert(lines, "DisplayName: " .. hum.DisplayName)
-                table.insert(lines, "Health: " .. hum.Health .. "/" .. hum.MaxHealth)
-            end
-            table.insert(lines, "")
-            table.insert(lines, "extractName() = " .. extractName(d))
-            table.insert(lines, "extractRank() = " .. extractRank(d))
-            inspectBox.Text = table.concat(lines, "\n")
-            setStatus("Inspeção na UI ✓")
-            return
-        end
-    end
-    inspectBox.Text = "Nenhum mob pra inspecionar."
-end
-
-makeButton("🔬 Inspecionar 1º Mob (na UI)", inspectFirstMob)
-
-makeSection("CONTROLE")
-
-makeButton("🛑 Parar Auto Farm", function()
+makeButton(farmPage, "🛑 Parar Auto Farm", function()
     Config.AutoFarm = false
     State.CurrentTarget = nil
     State.TargetTeleported = false
     autoFarmToggle.setState(false)
-    autoFarmToggle.button.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-    autoFarmToggle.button.Text = "✘  ⚔️ Ativar Auto Farm"
     setStatus("Auto Farm parado")
 end)
 
-closeBtn.MouseButton1Click:Connect(function()
-    Config.AutoFarm = false
-    screenGui:Destroy()
+-- ============================
+-- ABA 2: UPGRADES
+-- ============================
+local upgradePage = createTab("Upgrades")
+
+makeSection(upgradePage, "RANK UP")
+
+makeToggle(upgradePage, "⬆️ Auto RankUp", false, function(state)
+    Config.AutoRankUp = state
+    setStatus("Auto RankUp: " .. (state and "ON" or "OFF"))
 end)
 
-print("[AutoFarm v9] Pronto!")
-setStatus("Clique em '🔍 Escanear Mobs'")
+makeSection(upgradePage, "STARS")
+
+makeToggle(upgradePage, "⭐ Auto Open Star 1", false, function(state)
+    Config.AutoStar1 = state
+    setStatus("Auto Star 1: " .. (state and "ON" or "OFF"))
+end)
+
+makeToggle(upgradePage, "🌟 Auto Open Star 2", false, function(state)
+    Config.AutoStar2 = state
+    setStatus("Auto Star 2: " .. (state and "ON" or "OFF"))
+end)
+
+makeSection(upgradePage, "INFO")
+local upgradeInfo = Instance.new("TextLabel")
+upgradeInfo.Size = UDim2.new(1, 0, 0, 50)
+upgradeInfo.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+upgradeInfo.BorderSizePixel = 0
+upgradeInfo.Text = "  ⚠️ Essas funções usam RemoteEvents do jogo.\n  Podem ser detectadas. Use com moderação."
+upgradeInfo.TextColor3 = Color3.fromRGB(230, 200
